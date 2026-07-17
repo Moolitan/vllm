@@ -438,6 +438,16 @@ class Worker(WorkerBase):
                 self.model_runner.get_model(),
             )
 
+        # LMCache CacheBlend needs the raw model object registered before its
+        # KV connector initializes (initialize_from_config, called later).
+        try:
+            from lmcache.integration.vllm.utils import ENGINE_NAME
+            from lmcache.v1.compute.models.utils import VLLMModelTracker
+        except ImportError:
+            pass
+        else:
+            VLLMModelTracker.register_model(ENGINE_NAME, self.model_runner.get_model())
+
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
 

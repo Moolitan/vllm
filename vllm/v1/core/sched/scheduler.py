@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -65,6 +67,28 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+_SECONDARY_LOOKUP_EVENT_MARKER = "SEGMENTIA_SECONDARY_LOOKUP_EVENT"
+
+
+def _log_secondary_lookup_event(
+    event: str, request_id: str, **fields: Any
+) -> None:
+    payload = {"event": event, "request_id": request_id, **fields}
+    logger.info(
+        "%s %s",
+        _SECONDARY_LOOKUP_EVENT_MARKER,
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+    )
+
+
+@dataclass
+class _SecondaryLookupState:
+    segment_start: int
+    cursor: int # The stopping position P of the first local computation.
+    # initial → requeued → lookup_complete or initial → requeued → local_fallback
+    phase: str = "initial"
+    pinned_blocks: tuple[KVCacheBlock, ...] = ()
 
 
 class Scheduler(SchedulerInterface):
@@ -347,6 +371,141 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
+        # Phase-1 experimental state. Entries exist only for requests carrying
+        # an explicit lmcache_secondary_lookup config.
+        self._secondary_lookups: dict[str, _SecondaryLookupState] = {}
+
+    def _register_secondary_lookup(self, request: Request) -> None:
+        params = request.kv_transfer_params or {}
+        config = params.get("lmcache_secondary_lookup")
+        if config is None:
+            return
+        if not isinstance(config, dict):
+            raise ValueError("lmcache_secondary_lookup must be a mapping")
+        if config.get("probe_only") is not True:
+            raise ValueError(
+                "phase-1 lmcache_secondary_lookup requires probe_only=true"
+            )
+        if not self.cache_config.enable_prefix_caching:
+            raise ValueError("lmcache_secondary_lookup requires prefix caching")
+        if self.connector is None:
+            raise ValueError("lmcache_secondary_lookup requires a KV connector")
+        if self.scheduler_config.async_scheduling:
+            raise ValueError(
+                "phase-1 lmcache_secondary_lookup does not support async scheduling"
+            )
+        if self.has_mamba_layers:
+            raise ValueError(
+                "phase-1 lmcache_secondary_lookup supports full attention only"
+            )
+        if request.resumable:
+            raise ValueError("lmcache_secondary_lookup does not support streaming")
+
+        segment_start = config.get("segment_start")
+        if isinstance(segment_start, bool) or not isinstance(segment_start, int):
+            raise ValueError("lmcache_secondary_lookup.segment_start must be an int")
+        if not 0 < segment_start < request.num_prompt_tokens:
+            raise ValueError(
+                "lmcache_secondary_lookup.segment_start must be inside the prompt"
+            )
+
+        alignment = math.lcm(self.hash_block_size, self.block_size)
+        cursor = (segment_start + alignment - 1) // alignment * alignment
+        if cursor >= request.num_prompt_tokens:
+            raise ValueError(
+                "lmcache_secondary_lookup has no cacheable boundary before prompt end"
+            )
+        self._secondary_lookups[request.request_id] = _SecondaryLookupState(
+            segment_start=segment_start,
+            cursor=cursor,
+        )
+        config["lookup_cursor"] = cursor
+        _log_secondary_lookup_event(
+            "secondary_lookup_boundary",
+            request.request_id,
+            segment_start=segment_start,
+            lookup_cursor=cursor,
+            alignment=alignment,
+            prompt_tokens=request.num_prompt_tokens,
+            phase="initial",
+        )
+
+    def _limit_secondary_lookup_chunk(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> int:
+        state = self._secondary_lookups.get(request.request_id)
+        if state is None or state.phase != "initial":
+            return num_new_tokens
+        return min(num_new_tokens, max(state.cursor - num_computed_tokens, 0))
+
+    def _requeue_for_secondary_lookup(self, request: Request) -> None:
+        state = self._secondary_lookups[request.request_id]
+        assert state.phase == "initial"
+        assert request.num_computed_tokens == state.cursor
+        assert request.num_in_flight_tokens == 0
+
+        state.pinned_blocks = self.kv_cache_manager.pin_request_blocks(
+            request.request_id
+        )
+        _log_secondary_lookup_event(
+            "secondary_lookup_pinned",
+            request.request_id,
+            lookup_cursor=state.cursor,
+            num_computed_tokens=request.num_computed_tokens,
+            num_in_flight_tokens=request.num_in_flight_tokens,
+            pinned_block_count=len(state.pinned_blocks),
+            phase=state.phase,
+        )
+        state.phase = "requeued"
+        self._preempt_request(request, time.monotonic())
+        _log_secondary_lookup_event(
+            "secondary_lookup_requeued",
+            request.request_id,
+            lookup_cursor=state.cursor,
+            num_computed_tokens=request.num_computed_tokens,
+            num_in_flight_tokens=request.num_in_flight_tokens,
+            pinned_block_count=len(state.pinned_blocks),
+            phase=state.phase,
+        )
+
+    def _finish_secondary_lookup_reattach(
+        self, request: Request, num_local_computed_tokens: int
+    ) -> None:
+        state = self._secondary_lookups.get(request.request_id)
+        if state is None or state.phase != "requeued":
+            return
+
+        config = (request.kv_transfer_params or {})["lmcache_secondary_lookup"]
+        config["local_apc_hit_tokens"] = num_local_computed_tokens
+        config["local_apc_reattached"] = num_local_computed_tokens >= state.cursor
+        state.phase = (
+            "lookup_complete"
+            if num_local_computed_tokens >= state.cursor
+            else "local_fallback"
+        )
+        _log_secondary_lookup_event(
+            "secondary_lookup_local_reattach",
+            request.request_id,
+            lookup_cursor=state.cursor,
+            local_apc_hit_tokens=num_local_computed_tokens,
+            local_apc_reattached=num_local_computed_tokens >= state.cursor,
+            pinned_block_count=len(state.pinned_blocks),
+            phase=state.phase,
+        )
+        self.kv_cache_manager.unpin_blocks(state.pinned_blocks)
+        state.pinned_blocks = ()
+        _log_secondary_lookup_event(
+            "secondary_lookup_unpinned",
+            request.request_id,
+            lookup_cursor=state.cursor,
+            pinned_block_count=0,
+            phase=state.phase,
+        )
+
+    def _release_secondary_lookup_state(self, request_id: str) -> None:
+        state = self._secondary_lookups.pop(request_id, None)
+        if state is not None and state.pinned_blocks:
+            self.kv_cache_manager.unpin_blocks(state.pinned_blocks)
 
     def _mamba_block_aligned_split(
         self,
@@ -511,6 +670,9 @@ class Scheduler(SchedulerInterface):
                 self.max_model_len
                 - request.num_computed_tokens
                 - self.num_sampled_tokens_per_step,
+            )
+            num_new_tokens = self._limit_secondary_lookup_chunk(
+                request, request.num_computed_tokens, num_new_tokens
             )
 
             # Schedule encoder inputs.
@@ -866,6 +1028,9 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    num_new_tokens = self._limit_secondary_lookup_chunk(
+                        request, num_computed_tokens, num_new_tokens
+                    )
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -967,6 +1132,10 @@ class Scheduler(SchedulerInterface):
                             num_hits=connector_prefix_cache_hits,
                             preempted=request.num_preemptions > 0,
                         )
+
+                self._finish_secondary_lookup_reattach(
+                    request, num_new_local_computed_tokens
+                )
 
                 request = request_queue.pop_request()
                 if load_kv_async:
@@ -1642,6 +1811,7 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        secondary_requeued_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -1844,9 +2014,32 @@ class Scheduler(SchedulerInterface):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
+            secondary_state = self._secondary_lookups.get(req_id)
+            if (
+                secondary_state is not None
+                and secondary_state.phase == "initial"
+                and not stopped
+                and not new_token_ids
+                and request.status == RequestStatus.RUNNING
+                and request.num_computed_tokens == secondary_state.cursor
+                and request.num_in_flight_tokens == 0
+            ):
+                _log_secondary_lookup_event(
+                    "secondary_lookup_forward_complete",
+                    request.request_id,
+                    lookup_cursor=secondary_state.cursor,
+                    num_computed_tokens=request.num_computed_tokens,
+                    num_in_flight_tokens=request.num_in_flight_tokens,
+                    phase=secondary_state.phase,
+                )
+                self._requeue_for_secondary_lookup(request)
+                secondary_requeued_reqs.add(request)
+
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
             self.running = remove_all(self.running, stopped_running_reqs)
+        if secondary_requeued_reqs:
+            self.running = remove_all(self.running, secondary_requeued_reqs)
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
@@ -2115,6 +2308,7 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            self._register_secondary_lookup(request)
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
@@ -2193,6 +2387,7 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
+        self._release_secondary_lookup_state(request.request_id)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing

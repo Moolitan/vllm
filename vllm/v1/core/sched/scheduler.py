@@ -408,6 +408,16 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 "lmcache_secondary_lookup.segment_start must be inside the prompt"
             )
+        if config["probe_only"] is False:
+            segment_end = config.get("segment_end")
+            if isinstance(segment_end, bool) or not isinstance(segment_end, int):
+                raise ValueError(
+                    "lmcache_secondary_lookup.segment_end must be an int in apply mode"
+                )
+            if not segment_start < segment_end <= request.num_prompt_tokens:
+                raise ValueError(
+                    "lmcache_secondary_lookup.segment_end must close the segment"
+                )
 
         alignment = math.lcm(self.hash_block_size, self.block_size)
         cursor = (segment_start + alignment - 1) // alignment * alignment

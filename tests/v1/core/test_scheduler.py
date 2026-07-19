@@ -151,7 +151,7 @@ def test_secondary_lookup_accepts_explicit_apply_mode(tmp_path, monkeypatch):
         skip_tokenizer_init=True,
     )
     (request,) = create_requests(num_requests=1, num_tokens=80, block_size=16)
-    config = {"segment_start": 33, "probe_only": False}
+    config = {"segment_start": 33, "segment_end": 65, "probe_only": False}
     request.kv_transfer_params = {"lmcache_secondary_lookup": config}
 
     scheduler.add_request(request)
@@ -159,6 +159,24 @@ def test_secondary_lookup_accepts_explicit_apply_mode(tmp_path, monkeypatch):
 
     assert config["lookup_cursor"] == 48
     assert first.num_scheduled_tokens[request.request_id] == 48
+
+
+def test_secondary_lookup_apply_requires_segment_end(tmp_path, monkeypatch):
+    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
+    scheduler = create_scheduler(
+        model=_make_local_opt_config(tmp_path),
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+        block_size=16,
+        skip_tokenizer_init=True,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=80, block_size=16)
+    request.kv_transfer_params = {
+        "lmcache_secondary_lookup": {"segment_start": 33, "probe_only": False}
+    }
+
+    with pytest.raises(ValueError, match="segment_end must be an int"):
+        scheduler.add_request(request)
 
 
 def test_secondary_lookup_falls_back_when_local_apc_entry_is_missing(

@@ -382,9 +382,9 @@ class Scheduler(SchedulerInterface):
             return
         if not isinstance(config, dict):
             raise ValueError("lmcache_secondary_lookup must be a mapping")
-        if config.get("probe_only") is not True:
+        if not isinstance(config.get("probe_only"), bool):
             raise ValueError(
-                "phase-1 lmcache_secondary_lookup requires probe_only=true"
+                "lmcache_secondary_lookup.probe_only must be an explicit bool"
             )
         if not self.cache_config.enable_prefix_caching:
             raise ValueError("lmcache_secondary_lookup requires prefix caching")
@@ -392,11 +392,11 @@ class Scheduler(SchedulerInterface):
             raise ValueError("lmcache_secondary_lookup requires a KV connector")
         if self.scheduler_config.async_scheduling:
             raise ValueError(
-                "phase-1 lmcache_secondary_lookup does not support async scheduling"
+                "lmcache_secondary_lookup does not support async scheduling"
             )
         if self.has_mamba_layers:
             raise ValueError(
-                "phase-1 lmcache_secondary_lookup supports full attention only"
+                "lmcache_secondary_lookup supports full attention only"
             )
         if request.resumable:
             raise ValueError("lmcache_secondary_lookup does not support streaming")

@@ -5,8 +5,10 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from transformers import OPTConfig
 
 import vllm.envs as envs
+import vllm.platforms
 from vllm.config import (
     CacheConfig,
     ECTransferConfig,
@@ -22,6 +24,7 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItem,
     PlaceholderRange,
 )
+from vllm.platforms.cpu import CpuPlatform
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
@@ -41,6 +44,160 @@ from vllm.v1.structured_output import StructuredOutputManager
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def _empty_model_runner_output(request: Request) -> ModelRunnerOutput:
+    return ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
+def _make_local_opt_config(tmp_path) -> str:
+    model_dir = tmp_path / "opt"
+    OPTConfig(
+        architectures=["OPTForCausalLM"],
+        hidden_size=32,
+        ffn_dim=64,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        vocab_size=128,
+    ).save_pretrained(model_dir)
+    return str(model_dir)
+
+
+def test_secondary_lookup_requeues_after_output_and_reattaches_apc(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
+    block_size = 16
+    scheduler = create_scheduler(
+        model=_make_local_opt_config(tmp_path),
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+        block_size=block_size,
+        skip_tokenizer_init=True,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=80,
+        block_size=block_size,
+        req_ids=["secondary"],
+    )
+    config = {"segment_start": 33, "probe_only": True}
+    request.kv_transfer_params = {"lmcache_secondary_lookup": config}
+    scheduler.add_request(request)
+
+    first = scheduler.schedule()
+    assert config["lookup_cursor"] == 48
+    assert first.num_scheduled_tokens[request.request_id] == 48
+    assert request.num_computed_tokens == 48
+    assert request.num_in_flight_tokens == 48
+    assert scheduler._secondary_lookups[request.request_id].phase == "initial"
+
+    scheduler.update_from_output(first, _empty_model_runner_output(request))
+
+    state = scheduler._secondary_lookups[request.request_id]
+    assert request.status == RequestStatus.PREEMPTED
+    assert request.num_computed_tokens == 0
+    assert request.num_in_flight_tokens == 0
+    assert state.phase == "requeued"
+    assert len(state.pinned_blocks) == 3
+    assert all(block.ref_cnt == 1 for block in state.pinned_blocks)
+
+    second = scheduler.schedule()
+
+    assert second.num_scheduled_tokens[request.request_id] == 32
+    assert config["local_apc_hit_tokens"] == 48
+    assert config["local_apc_reattached"] is True
+    assert state.phase == "lookup_complete"
+    assert state.pinned_blocks == ()
+    attached = scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[0]
+    assert all(block.ref_cnt == 1 for block in attached)
+
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    assert request.request_id not in scheduler._secondary_lookups
+    assert all(block.ref_cnt == 0 for block in attached)
+
+
+def test_secondary_lookup_requires_explicit_mode(tmp_path, monkeypatch):
+    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
+    scheduler = create_scheduler(
+        model=_make_local_opt_config(tmp_path),
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+        skip_tokenizer_init=True,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=80)
+    request.kv_transfer_params = {
+        "lmcache_secondary_lookup": {"segment_start": 33}
+    }
+
+    with pytest.raises(ValueError, match="probe_only must be an explicit bool"):
+        scheduler.add_request(request)
+
+
+def test_secondary_lookup_accepts_explicit_apply_mode(tmp_path, monkeypatch):
+    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
+    scheduler = create_scheduler(
+        model=_make_local_opt_config(tmp_path),
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+        block_size=16,
+        skip_tokenizer_init=True,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=80, block_size=16)
+    config = {"segment_start": 33, "probe_only": False}
+    request.kv_transfer_params = {"lmcache_secondary_lookup": config}
+
+    scheduler.add_request(request)
+    first = scheduler.schedule()
+
+    assert config["lookup_cursor"] == 48
+    assert first.num_scheduled_tokens[request.request_id] == 48
+
+
+def test_secondary_lookup_falls_back_when_local_apc_entry_is_missing(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
+    scheduler = create_scheduler(
+        model=_make_local_opt_config(tmp_path),
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+        block_size=16,
+        skip_tokenizer_init=True,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=80,
+        block_size=16,
+        req_ids=["secondary-fallback"],
+    )
+    config = {"segment_start": 33, "probe_only": True}
+    request.kv_transfer_params = {"lmcache_secondary_lookup": config}
+    scheduler.add_request(request)
+
+    first = scheduler.schedule()
+    scheduler.update_from_output(first, _empty_model_runner_output(request))
+    state = scheduler._secondary_lookups[request.request_id]
+    pinned_blocks = state.pinned_blocks
+    scheduler.kv_cache_manager.block_pool.evict_blocks(
+        {block.block_id for block in pinned_blocks}
+    )
+
+    second = scheduler.schedule()
+
+    assert second.num_scheduled_tokens[request.request_id] == 80
+    assert config["local_apc_hit_tokens"] == 0
+    assert config["local_apc_reattached"] is False
+    assert state.phase == "local_fallback"
+    assert state.pinned_blocks == ()
+    assert all(block.ref_cnt == 0 for block in pinned_blocks)
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():

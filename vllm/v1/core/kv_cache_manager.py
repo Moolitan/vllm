@@ -513,27 +513,6 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
-    def pin_request_blocks(self, request_id: str) -> tuple[KVCacheBlock, ...]:
-        """Temporarily retain the blocks currently owned by a request.
-
-        The returned blocks must be passed to :meth:`unpin_blocks`. Blocks are
-        deduplicated by ID because cache groups may share the same physical
-        block under cross-layer allocation.
-        """
-        blocks_by_id: dict[int, KVCacheBlock] = {}
-        for group in self.coordinator.get_blocks(request_id):
-            for block in group:
-                if not block.is_null:
-                    blocks_by_id.setdefault(block.block_id, block)
-
-        blocks = tuple(blocks_by_id.values())
-        self.block_pool.touch(blocks) # Increment the reference count by one
-        return blocks
-
-    def unpin_blocks(self, blocks: tuple[KVCacheBlock, ...]) -> None:
-        """Release blocks retained by :meth:`pin_request_blocks`."""
-        self.block_pool.free_blocks(reversed(blocks))
-
     def remove_skipped_blocks(
         self,
         request_id: str,

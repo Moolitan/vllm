@@ -3,6 +3,7 @@
 import itertools
 import json
 import math
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -69,12 +70,18 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 _SECONDARY_LOOKUP_EVENT_MARKER = "SEGMENTIA_SECONDARY_LOOKUP_EVENT"
+_SECONDARY_PROFILE_ENABLED = os.getenv("SEGMENTIA_SECONDARY_PROFILE", "0") == "1"
 
 
 def _log_secondary_lookup_event(
     event: str, request_id: str, **fields: Any
 ) -> None:
-    payload = {"event": event, "request_id": request_id, **fields}
+    payload = {
+        "event": event,
+        "request_id": request_id,
+        "monotonic_ns": time.perf_counter_ns(),
+        **fields,
+    }
     logger.info(
         "%s %s",
         _SECONDARY_LOOKUP_EVENT_MARKER,
@@ -85,10 +92,9 @@ def _log_secondary_lookup_event(
 @dataclass
 class _SecondaryLookupState:
     segment_start: int
-    cursor: int # The stopping position P of the first local computation.
-    # initial → requeued → lookup_complete or initial → requeued → local_fallback
+    cursor: int  # The stopping position P of the first local computation.
+    # initial → waiting_secondary_lookup → lookup_complete/local_fallback
     phase: str = "initial"
-    pinned_blocks: tuple[KVCacheBlock, ...] = ()
 
 
 class Scheduler(SchedulerInterface):
@@ -443,6 +449,8 @@ class Scheduler(SchedulerInterface):
     def _limit_secondary_lookup_chunk(
         self, request: Request, num_computed_tokens: int, num_new_tokens: int
     ) -> int:
+        """限制forward 只能计算到复用的起点位置前面
+        """
         state = self._secondary_lookups.get(request.request_id)
         if state is None or state.phase != "initial":
             return num_new_tokens
@@ -451,71 +459,65 @@ class Scheduler(SchedulerInterface):
     def _requeue_for_secondary_lookup(self, request: Request) -> None:
         state = self._secondary_lookups[request.request_id]
         assert state.phase == "initial"
+        assert request.status == RequestStatus.RUNNING
         assert request.num_computed_tokens == state.cursor
         assert request.num_in_flight_tokens == 0
 
-        state.pinned_blocks = self.kv_cache_manager.pin_request_blocks(
-            request.request_id
-        )
-        _log_secondary_lookup_event(
-            "secondary_lookup_pinned",
-            request.request_id,
-            lookup_cursor=state.cursor,
-            num_computed_tokens=request.num_computed_tokens,
-            num_in_flight_tokens=request.num_in_flight_tokens,
-            pinned_block_count=len(state.pinned_blocks),
-            phase=state.phase,
-        )
-        state.phase = "requeued"
-        self._preempt_request(request, time.monotonic())
+        # Whether this is a secondary pause is tracked by the state phase.
+        state.phase = "waiting_secondary_lookup"
+
+        # 该 chunk 已经完成，不再视为 in-flight prefill
+        self._inflight_prefills.discard(request)
+
+        # 使用 PREEMPTED，是因为 waiting 准入完成后的现有代码只接受
+        # WAITING 或 PREEMPTED；但这里不执行普通 _preempt_request()
+        # 否则会 free 操作
+        request.status = RequestStatus.PREEMPTED
+
+        # 关键：
+        # 1. 不调用 _free_request_blocks()
+        # 2. 不把 num_computed_tokens 清零
+        # 3. 不增加 num_preemptions
+        # 4. 不 pin
+        self.waiting.prepend_request(request)
         _log_secondary_lookup_event(
             "secondary_lookup_requeued",
             request.request_id,
             lookup_cursor=state.cursor,
             num_computed_tokens=request.num_computed_tokens,
             num_in_flight_tokens=request.num_in_flight_tokens,
-            pinned_block_count=len(state.pinned_blocks),
+            retained_block_ownership=True,
             phase=state.phase,
         )
 
-    def _finish_secondary_lookup_reattach(
-        self, request: Request, num_local_computed_tokens: int
+    def _finish_secondary_lookup(
+        self, request: Request, num_external_computed_tokens: int
     ) -> None:
         state = self._secondary_lookups.get(request.request_id)
-        if state is None or state.phase != "requeued":
+        if state is None or state.phase != "waiting_secondary_lookup":
             return
 
         config = (request.kv_transfer_params or {})["lmcache_secondary_lookup"]
-        config["local_apc_hit_tokens"] = num_local_computed_tokens
-        config["local_apc_reattached"] = num_local_computed_tokens >= state.cursor
+        config["retained_local_tokens"] = state.cursor
+        config["external_hit_tokens"] = num_external_computed_tokens
+
         state.phase = (
             "lookup_complete"
-            if num_local_computed_tokens >= state.cursor
+            if num_external_computed_tokens > 0
             else "local_fallback"
         )
         _log_secondary_lookup_event(
-            "secondary_lookup_local_reattach",
+            "secondary_lookup_complete",
             request.request_id,
             lookup_cursor=state.cursor,
-            local_apc_hit_tokens=num_local_computed_tokens,
-            local_apc_reattached=num_local_computed_tokens >= state.cursor,
-            pinned_block_count=len(state.pinned_blocks),
-            phase=state.phase,
-        )
-        self.kv_cache_manager.unpin_blocks(state.pinned_blocks)
-        state.pinned_blocks = ()
-        _log_secondary_lookup_event(
-            "secondary_lookup_unpinned",
-            request.request_id,
-            lookup_cursor=state.cursor,
-            pinned_block_count=0,
+            retained_local_tokens=state.cursor,
+            external_tokens=num_external_computed_tokens,
+            retained_block_ownership=True,
             phase=state.phase,
         )
 
     def _release_secondary_lookup_state(self, request_id: str) -> None:
-        state = self._secondary_lookups.pop(request_id, None)
-        if state is not None and state.pinned_blocks:
-            self.kv_cache_manager.unpin_blocks(state.pinned_blocks)
+        self._secondary_lookups.pop(request_id, None)
 
     def _mamba_block_aligned_split(
         self,
@@ -879,9 +881,68 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
 
-                # Get already-cached tokens.
-                if request.num_computed_tokens == 0:
-                    # Get locally-cached tokens.
+                secondary_state = self._secondary_lookups.get(request.request_id)
+                is_secondary_reentry = (
+                    secondary_state is not None
+                    and secondary_state.phase == "waiting_secondary_lookup"
+                )
+
+                if is_secondary_reentry:
+                    # Secondary connector lookup after an ownership-preserving pause.
+                    assert secondary_state is not None
+                    assert request.status == RequestStatus.PREEMPTED
+                    assert request.num_computed_tokens == secondary_state.cursor
+                    assert request.num_in_flight_tokens == 0
+
+                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                    num_new_local_computed_tokens = 0
+
+                    # connector 应从现有本地计算终点 P 开始查询
+                    connector_lookup_start = request.num_computed_tokens
+
+                    connector_lookup_started = time.perf_counter_ns()
+                    ext_tokens, load_kv_async = (
+                        self.connector.get_num_new_matched_tokens(
+                            request,
+                            connector_lookup_start,
+                        )
+                    )
+
+                    if _SECONDARY_PROFILE_ENABLED:
+                        _log_secondary_lookup_event(
+                            "secondary_profile_connector_lookup",
+                            request.request_id,
+                            duration_ms=(
+                                time.perf_counter_ns() - connector_lookup_started
+                            )
+                            / 1_000_000,
+                            external_tokens=ext_tokens,
+                            phase=secondary_state.phase,
+                        )
+
+                    if ext_tokens is None:
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+
+                    num_external_computed_tokens = ext_tokens
+                    assert num_external_computed_tokens >= 0
+
+                    # 总计算进度必须包括此前已经保留的 P
+                    num_computed_tokens = (
+                        request.num_computed_tokens
+                        + num_external_computed_tokens
+                    )
+                    assert num_computed_tokens <= request.num_tokens
+
+                    connector_prefix_cache_queries = (
+                        request.num_tokens - connector_lookup_start
+                    )
+
+                    connector_prefix_cache_hits = num_external_computed_tokens
+
+                elif request.num_computed_tokens == 0:
+                    # Ordinary new request or ordinary preempted request.
                     if (
                         self.connector is not None
                         and self.has_mamba_layers
@@ -981,8 +1042,10 @@ class Scheduler(SchedulerInterface):
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
+                    # 这个请求之前已经查过 KV，并且已经知道有多少 KV 可以复用。
+                    # 典型情况就是查完之后，异步等待传输的完成
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
-                    num_new_local_computed_tokens = 0
+                    num_new_local_computed_tokens = 0  # 本地前缀命中为 0，是外部的
                     num_computed_tokens = request.num_computed_tokens
 
                 encoder_inputs_to_schedule = None
@@ -1038,6 +1101,7 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    # 这里是第一次进入 waiting 队列时，防止进入 running 时，一次把复用以及复用后面的位置也调度进去
                     num_new_tokens = self._limit_secondary_lookup_chunk(
                         request, num_computed_tokens, num_new_tokens
                     )
@@ -1100,6 +1164,7 @@ class Scheduler(SchedulerInterface):
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
 
+                allocation_started = time.perf_counter_ns()
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -1113,6 +1178,73 @@ class Scheduler(SchedulerInterface):
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
                 )
+                if (
+                    _SECONDARY_PROFILE_ENABLED
+                    and request.request_id in self._secondary_lookups
+                    and self._secondary_lookups[request.request_id].phase
+                    == "waiting_secondary_lookup"
+                ):
+                    _log_secondary_lookup_event(
+                        "secondary_profile_allocate_slots",
+                        request.request_id,
+                        duration_ms=(time.perf_counter_ns() - allocation_started)
+                        / 1_000_000,
+                        external_tokens=num_external_computed_tokens,
+                        allocated=new_blocks is not None,
+                        phase="waiting_secondary_lookup",
+                    )
+
+                if (
+                    new_blocks is None
+                    and is_secondary_reentry
+                    and num_external_computed_tokens > 0
+                ):
+                    # 请求仍然拥有 [0, P)，因此外部分配失败可以回退到从 P 进行本地计算，而不会丢弃已计算的键值。
+                    # 下面的成功本地分配会调用 update_state_after_alloc(..., 0)，该函数会清除连接器缓存的查找状态。
+
+                    # 如果 LMCache 找到了复用的token，但是没有足够的 slots 接收 external KV
+                    self._finish_secondary_lookup(request, 0)
+                    num_external_computed_tokens = 0
+                    load_kv_async = False
+                    num_computed_tokens = request.num_computed_tokens
+                    num_new_tokens = request.num_tokens - num_computed_tokens
+                    threshold = self.scheduler_config.long_prefill_token_threshold
+                    if 0 < threshold < num_new_tokens:
+                        num_new_tokens = threshold
+                    if (
+                        not self.scheduler_config.enable_chunked_prefill
+                        and num_new_tokens > token_budget
+                    ):
+                        break
+                    num_new_tokens = min(num_new_tokens, token_budget)
+                    assert num_new_tokens > 0
+
+                    effective_lookahead_tokens = self.num_lookahead_tokens
+                    # 从 复用位置钱开始正常推理，不会回退到 token 0 重新推理
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens,
+                        num_new_computed_tokens=0,
+                        new_computed_blocks=(
+                            self.kv_cache_manager.empty_kv_cache_blocks
+                        ),
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        num_external_computed_tokens=0,
+                        delay_cache_blocks=False,
+                        num_encoder_tokens=num_encoder_tokens,
+                        full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                        reserved_blocks=0,
+                        has_scheduled_reqs=bool(self.running),
+                    )
+                    _log_secondary_lookup_event(
+                        "secondary_lookup_allocation_fallback",
+                        request.request_id,
+                        lookup_cursor=secondary_state.cursor,
+                        retained_local_tokens=request.num_computed_tokens,
+                        local_tokens_to_schedule=num_new_tokens,
+                        allocated=new_blocks is not None,
+                        phase=secondary_state.phase,
+                    )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -1143,8 +1275,8 @@ class Scheduler(SchedulerInterface):
                             preempted=request.num_preemptions > 0,
                         )
 
-                self._finish_secondary_lookup_reattach(
-                    request, num_new_local_computed_tokens
+                self._finish_secondary_lookup(
+                    request, num_external_computed_tokens
                 )
 
                 request = request_queue.pop_request()
@@ -2024,6 +2156,7 @@ class Scheduler(SchedulerInterface):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
+            # Forward 完成后 从 runing 到 waiting 的触发判断条件
             secondary_state = self._secondary_lookups.get(req_id)
             if (
                 secondary_state is not None
@@ -2782,7 +2915,12 @@ class Scheduler(SchedulerInterface):
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
             self._update_waiting_for_remote_kv(request)
-            if request.num_preemptions:
+            secondary_state = self._secondary_lookups.get(request.request_id)
+            secondary_is_resumed = (
+                secondary_state is not None
+                and secondary_state.phase in ("lookup_complete", "local_fallback")
+            )
+            if request.num_preemptions or secondary_is_resumed:
                 request.status = RequestStatus.PREEMPTED
             else:
                 request.status = RequestStatus.WAITING

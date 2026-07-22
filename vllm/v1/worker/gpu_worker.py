@@ -1013,18 +1013,30 @@ class Worker(WorkerBase):
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # ensure any previous non-blocking PP sends are complete
+        # GPUWorker 的顶层推理入口，专门处理 Pipeline Parallel（流水并行 PP）
+        # 跨 GPU 中间张量收发；
+        # 非 PP 场景直接下沉调用 model_runner 执行一轮 batch 推理，返回采样结果。
+
+        # vLLM V1 支持 PP：模型被切分成多段，放在多张 GPU 上串行执行；
+        # 前一段 GPU 算出 hidden_states，要传给下一段 GPU 继续前向。
+
+        # 等待上一轮未完成的 PP 异步发送
+        # 上一轮异步 isend 不能还在跑就启动新一轮推理，防止通信错乱
         if self._pp_send_work:
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
 
         intermediate_tensors = None
+        # 判断是否需要真正跑前向：forward_pass = 是否有token需要调度
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         all_gather_tensors = {}
         compilation_config = self.vllm_config.compilation_config
         parallel_config = self.vllm_config.parallel_config
 
+        # SP（Sequence Parallel）相关预处理（可选分支）
+        # 序列并行场景，标记哪些张量需要 TP 组 allgather
         if (
             parallel_config.pipeline_parallel_size > 1
             and compilation_config.pass_config.enable_sp
@@ -1054,7 +1066,9 @@ class Worker(WorkerBase):
                 )
             }
 
+        # 非 PP 首卡：异步接收上游 GPU 传来的中间张量
         if forward_pass and not get_pp_group().is_first_rank:
+            # PP 第 2、3、… 卡：不用从零跑 prefill
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
                     all_gather_group=get_tp_group(),
@@ -1062,13 +1076,16 @@ class Worker(WorkerBase):
                 )
             )
             assert tensor_dict is not None
+            # 先异步接收前一张 GPU 输出的 hidden_states，作为本卡模型层的输入
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
             )
 
+        # 调用底层 model_runner.execute_model ()【真正 GPU 推理】
         with self.annotate_profile(scheduler_output):
+            # 进入模型 forward、PagedAttention、采样、生成 sampled_token_ids
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import json
 import os
 import queue
 import signal
@@ -88,6 +89,19 @@ from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
+_SEGMENTIA_PROFILE_ENABLED = os.getenv("SEGMENTIA_PROFILE", "0") == "1"
+_SEGMENTIA_PROFILE_MARKER = "SEGMENTIA_PROFILE_EVENT"
+
+
+def _log_segmentia_profile_event(event: str, **fields: Any) -> None:
+    if not _SEGMENTIA_PROFILE_ENABLED:
+        return
+    payload = {"event": event, "monotonic_ns": time.perf_counter_ns(), **fields}
+    logger.info(
+        "%s %s",
+        _SEGMENTIA_PROFILE_MARKER,
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+    )
 
 
 HANDSHAKE_TIMEOUT_MINS = 5
@@ -584,8 +598,11 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        step_started = time.perf_counter_ns()
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        schedule_finished = time.perf_counter_ns()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        submit_finished = time.perf_counter_ns()
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
@@ -594,12 +611,24 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+            model_finished = time.perf_counter_ns()
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
+        )
+        update_finished = time.perf_counter_ns()
+        _log_segmentia_profile_event(
+            "engine_step",
+            request_ids=list(scheduler_output.num_scheduled_tokens),
+            num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+            schedule_ms=(schedule_finished - step_started) / 1_000_000,
+            submit_ms=(submit_finished - schedule_finished) / 1_000_000,
+            model_wait_ms=(model_finished - submit_finished) / 1_000_000,
+            update_ms=(update_finished - model_finished) / 1_000_000,
+            total_ms=(update_finished - step_started) / 1_000_000,
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 

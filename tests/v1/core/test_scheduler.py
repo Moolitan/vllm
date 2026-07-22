@@ -70,7 +70,7 @@ def _make_local_opt_config(tmp_path) -> str:
     return str(model_dir)
 
 
-def test_secondary_lookup_requeues_after_output_and_reattaches_apc(
+def test_segmentia_lookup_requeues_with_owned_blocks_and_skips_apc(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
@@ -86,10 +86,10 @@ def test_secondary_lookup_requeues_after_output_and_reattaches_apc(
         num_requests=1,
         num_tokens=80,
         block_size=block_size,
-        req_ids=["secondary"],
+        req_ids=["segmentia"],
     )
     config = {"segment_start": 33, "probe_only": True}
-    request.kv_transfer_params = {"lmcache_secondary_lookup": config}
+    request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
     scheduler.add_request(request)
 
     first = scheduler.schedule()
@@ -97,34 +97,41 @@ def test_secondary_lookup_requeues_after_output_and_reattaches_apc(
     assert first.num_scheduled_tokens[request.request_id] == 48
     assert request.num_computed_tokens == 48
     assert request.num_in_flight_tokens == 48
-    assert scheduler._secondary_lookups[request.request_id].phase == "initial"
+    assert scheduler._segmentia_lookups[request.request_id].phase == "initial"
 
     scheduler.update_from_output(first, _empty_model_runner_output(request))
 
-    state = scheduler._secondary_lookups[request.request_id]
+    state = scheduler._segmentia_lookups[request.request_id]
     assert request.status == RequestStatus.PREEMPTED
-    assert request.num_computed_tokens == 0
+    assert request.num_computed_tokens == 48
     assert request.num_in_flight_tokens == 0
-    assert state.phase == "requeued"
-    assert len(state.pinned_blocks) == 3
-    assert all(block.ref_cnt == 1 for block in state.pinned_blocks)
+    assert state.phase == "waiting_segmentia_lookup"
+    retained_blocks = scheduler.kv_cache_manager.get_blocks(
+        request.request_id
+    ).blocks[0]
+    assert len(retained_blocks) == 3
+    assert all(block.ref_cnt == 1 for block in retained_blocks)
+
+    scheduler.kv_cache_manager.get_computed_blocks = Mock(
+        side_effect=AssertionError("segmentia reentry must skip APC lookup")
+    )
 
     second = scheduler.schedule()
 
     assert second.num_scheduled_tokens[request.request_id] == 32
-    assert config["local_apc_hit_tokens"] == 48
-    assert config["local_apc_reattached"] is True
-    assert state.phase == "lookup_complete"
-    assert state.pinned_blocks == ()
+    assert config["retained_local_tokens"] == 48
+    assert config["external_hit_tokens"] == 0
+    assert state.phase == "local_fallback"
     attached = scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[0]
+    assert attached[:3] == retained_blocks
     assert all(block.ref_cnt == 1 for block in attached)
 
     scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
-    assert request.request_id not in scheduler._secondary_lookups
+    assert request.request_id not in scheduler._segmentia_lookups
     assert all(block.ref_cnt == 0 for block in attached)
 
 
-def test_secondary_lookup_requires_explicit_mode(tmp_path, monkeypatch):
+def test_segmentia_lookup_requires_explicit_mode(tmp_path, monkeypatch):
     monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
     scheduler = create_scheduler(
         model=_make_local_opt_config(tmp_path),
@@ -134,14 +141,14 @@ def test_secondary_lookup_requires_explicit_mode(tmp_path, monkeypatch):
     )
     (request,) = create_requests(num_requests=1, num_tokens=80)
     request.kv_transfer_params = {
-        "lmcache_secondary_lookup": {"segment_start": 33}
+        "lmcache_segmentia_lookup": {"segment_start": 33}
     }
 
     with pytest.raises(ValueError, match="probe_only must be an explicit bool"):
         scheduler.add_request(request)
 
 
-def test_secondary_lookup_accepts_explicit_apply_mode(tmp_path, monkeypatch):
+def test_segmentia_lookup_accepts_explicit_apply_mode(tmp_path, monkeypatch):
     monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
     scheduler = create_scheduler(
         model=_make_local_opt_config(tmp_path),
@@ -152,7 +159,7 @@ def test_secondary_lookup_accepts_explicit_apply_mode(tmp_path, monkeypatch):
     )
     (request,) = create_requests(num_requests=1, num_tokens=80, block_size=16)
     config = {"segment_start": 33, "segment_end": 65, "probe_only": False}
-    request.kv_transfer_params = {"lmcache_secondary_lookup": config}
+    request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
 
     scheduler.add_request(request)
     first = scheduler.schedule()
@@ -161,7 +168,7 @@ def test_secondary_lookup_accepts_explicit_apply_mode(tmp_path, monkeypatch):
     assert first.num_scheduled_tokens[request.request_id] == 48
 
 
-def test_secondary_lookup_apply_requires_segment_end(tmp_path, monkeypatch):
+def test_segmentia_lookup_apply_requires_segment_end(tmp_path, monkeypatch):
     monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
     scheduler = create_scheduler(
         model=_make_local_opt_config(tmp_path),
@@ -172,14 +179,14 @@ def test_secondary_lookup_apply_requires_segment_end(tmp_path, monkeypatch):
     )
     (request,) = create_requests(num_requests=1, num_tokens=80, block_size=16)
     request.kv_transfer_params = {
-        "lmcache_secondary_lookup": {"segment_start": 33, "probe_only": False}
+        "lmcache_segmentia_lookup": {"segment_start": 33, "probe_only": False}
     }
 
     with pytest.raises(ValueError, match="segment_end must be an int"):
         scheduler.add_request(request)
 
 
-def test_secondary_lookup_falls_back_when_local_apc_entry_is_missing(
+def test_segmentia_lookup_applies_external_tokens_after_retained_prefix(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
@@ -194,28 +201,32 @@ def test_secondary_lookup_falls_back_when_local_apc_entry_is_missing(
         num_requests=1,
         num_tokens=80,
         block_size=16,
-        req_ids=["secondary-fallback"],
+        req_ids=["segmentia-fallback"],
     )
     config = {"segment_start": 33, "probe_only": True}
-    request.kv_transfer_params = {"lmcache_secondary_lookup": config}
+    request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
+    scheduler.connector.get_num_new_matched_tokens.side_effect = [
+        (0, False),
+        (16, False),
+    ]
     scheduler.add_request(request)
 
     first = scheduler.schedule()
     scheduler.update_from_output(first, _empty_model_runner_output(request))
-    state = scheduler._secondary_lookups[request.request_id]
-    pinned_blocks = state.pinned_blocks
-    scheduler.kv_cache_manager.block_pool.evict_blocks(
-        {block.block_id for block in pinned_blocks}
-    )
+    state = scheduler._segmentia_lookups[request.request_id]
+    retained_blocks = scheduler.kv_cache_manager.get_blocks(
+        request.request_id
+    ).blocks[0]
 
     second = scheduler.schedule()
 
-    assert second.num_scheduled_tokens[request.request_id] == 80
-    assert config["local_apc_hit_tokens"] == 0
-    assert config["local_apc_reattached"] is False
-    assert state.phase == "local_fallback"
-    assert state.pinned_blocks == ()
-    assert all(block.ref_cnt == 0 for block in pinned_blocks)
+    assert second.num_scheduled_tokens[request.request_id] == 16
+    assert config["retained_local_tokens"] == 48
+    assert config["external_hit_tokens"] == 16
+    assert state.phase == "lookup_complete"
+    scheduler.connector.get_num_new_matched_tokens.assert_called_with(request, 48)
+    attached = scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[0]
+    assert attached[:3] == retained_blocks
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():

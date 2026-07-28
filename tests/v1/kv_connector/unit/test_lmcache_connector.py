@@ -197,6 +197,31 @@ class TestGetKVConnectorKVCacheEvents:
         assert events[0].parent_block_hash is None
 
 
+class TestSegmentiaSchedulerDelegation:
+    def test_forwards_all_segmentia_scheduler_apis(self):
+        connector = object.__new__(LMCacheConnectorV1)
+        connector._lmcache_engine = MagicMock()
+        request = MagicMock()
+        connector._lmcache_engine.poll_segmentia_probe.return_value = 123
+        connector._lmcache_engine.activate_segmentia_probe.return_value = 45
+
+        connector.on_new_request(request)
+        assert connector.poll_segmentia_probe(request) == 123
+        assert connector.activate_segmentia_probe(request, 17) == 45
+        connector.rollback_segmentia_activation(request)
+        connector.cancel_segmentia_probe(request)
+
+        connector._lmcache_engine.on_new_request.assert_called_once_with(request)
+        connector._lmcache_engine.poll_segmentia_probe.assert_called_once_with(request)
+        connector._lmcache_engine.activate_segmentia_probe.assert_called_once_with(
+            request, 17
+        )
+        connector._lmcache_engine.rollback_segmentia_activation.assert_called_once_with(
+            request
+        )
+        connector._lmcache_engine.cancel_segmentia_probe.assert_called_once_with(request)
+
+
 class TestUpdateConnectorOutput:
     """Test update_connector_output method."""
 

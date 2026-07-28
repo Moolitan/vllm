@@ -256,6 +256,30 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
     # ==============================
     # Scheduler-side methods
     # ==============================
+    def on_new_request(self, request: "Request") -> None:
+        """Forward request admission so LMCache can submit Segmentia probes."""
+        self._lmcache_engine.on_new_request(request)
+
+    def poll_segmentia_probe(self, request: "Request") -> int | None:
+        """Return the ready Segmentia match, or ``None`` while pending."""
+        return self._lmcache_engine.poll_segmentia_probe(request)
+
+    def activate_segmentia_probe(
+        self, request: "Request", num_computed_tokens: int
+    ) -> int:
+        """Pin a ready Segmentia result before scheduler slot allocation."""
+        return self._lmcache_engine.activate_segmentia_probe(
+            request, num_computed_tokens
+        )
+
+    def rollback_segmentia_activation(self, request: "Request") -> None:
+        """Release Segmentia activation state after allocation failure."""
+        self._lmcache_engine.rollback_segmentia_activation(request)
+
+    def cancel_segmentia_probe(self, request: "Request") -> None:
+        """Cancel outstanding Segmentia probe state for a finished request."""
+        self._lmcache_engine.cancel_segmentia_probe(request)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -284,7 +308,9 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         """
         Update KVConnector state after block allocation.
         """
-        self._lmcache_engine.update_state_after_alloc(request, num_external_tokens)
+        self._lmcache_engine.update_state_after_alloc(
+            request, num_external_tokens, blocks
+        )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

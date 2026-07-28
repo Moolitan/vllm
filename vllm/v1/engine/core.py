@@ -620,16 +620,35 @@ class EngineCore:
             scheduler_output, model_output
         )
         update_finished = time.perf_counter_ns()
-        _log_segmentia_profile_event(
-            "engine_step",
-            request_ids=list(scheduler_output.num_scheduled_tokens),
-            num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-            schedule_ms=(schedule_finished - step_started) / 1_000_000,
-            submit_ms=(submit_finished - schedule_finished) / 1_000_000,
-            model_wait_ms=(model_finished - submit_finished) / 1_000_000,
-            update_ms=(update_finished - model_finished) / 1_000_000,
-            total_ms=(update_finished - step_started) / 1_000_000,
-        )
+        if scheduler_output.num_scheduled_tokens:
+            _log_segmentia_profile_event(
+                "engine_step",
+                request_ids=list(scheduler_output.num_scheduled_tokens),
+                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                model_output_req_ids=list(getattr(model_output, "req_ids", ())),
+                sampled_token_counts=[
+                    len(token_ids)
+                    for token_ids in (
+                        getattr(model_output, "sampled_token_ids", None) or ()
+                    )
+                ],
+                request_states={
+                    request_id: {
+                        "status": str(request.status),
+                        "num_computed_tokens": request.num_computed_tokens,
+                        "num_prompt_tokens": request.num_prompt_tokens,
+                        "num_output_tokens": request.num_output_tokens,
+                        "num_in_flight_tokens": request.num_in_flight_tokens,
+                    }
+                    for request_id in scheduler_output.num_scheduled_tokens
+                    if (request := self.scheduler.requests.get(request_id)) is not None
+                },
+                schedule_ms=(schedule_finished - step_started) / 1_000_000,
+                submit_ms=(submit_finished - schedule_finished) / 1_000_000,
+                model_wait_ms=(model_finished - submit_finished) / 1_000_000,
+                update_ms=(update_finished - model_finished) / 1_000_000,
+                total_ms=(update_finished - step_started) / 1_000_000,
+            )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0

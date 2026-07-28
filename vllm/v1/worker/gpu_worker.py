@@ -1014,14 +1014,72 @@ class Worker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # ensure any previous non-blocking PP sends are complete
         # GPUWorker 的顶层推理入口，专门处理 Pipeline Parallel（流水并行 PP）
-        # 跨 GPU 中间张量收发；
-        # 非 PP 场景直接下沉调用 model_runner 执行一轮 batch 推理，返回采样结果。
+        # GPUWorker 的顶层执行入口，不是直接执行 Transformer 模型的 _model_forward()
+        # GPUWorker.execute_model()          外层 worker 调度入口
+        #     ↓
+        # GPUModelRunner.execute_model()     准备 batch、KV、attention metadata
+        #     ↓
+        # KVConnector.start_load_kv()        LMCache load / Blend / Segmentia
+        #     ↓
+        # GPUModelRunner._model_forward()    普通 vLLM 模型 forward
 
-        # vLLM V1 支持 PP：模型被切分成多段，放在多张 GPU 上串行执行；
-        # 前一段 GPU 算出 hidden_states，要传给下一段 GPU 继续前向。
+        # ### GPUWorker.execute_model() 做什么
 
-        # 等待上一轮未完成的 PP 异步发送
-        # 上一轮异步 isend 不能还在跑就启动新一轮推理，防止通信错乱
+        # 它接收 Scheduler 产生的 SchedulerOutput：
+
+        # def execute_model(
+        #     self, scheduler_output: "SchedulerOutput"
+        # ):
+
+        # 主要负责：
+        # - 判断本轮有没有 scheduled tokens；
+        # - 处理 Pipeline Parallel 上一轮的异步通信；
+        # - 非首个 PP rank 接收上一张 GPU 的 hidden states；
+        # - 调用底层 model_runner.execute_model()；
+        # - 如果不是最后一个 PP rank，将中间结果发送给下一张 GPU。
+
+        # 真正下沉调用的位置在 vllm/vllm/v1/worker/gpu_worker.py:1086：
+        # output = self.model_runner.execute_model(
+        #     scheduler_output,
+        #     intermediate_tensors,
+        # )
+
+        # ### GPUModelRunner.execute_model() 做什么
+        # 下一层入口在 vllm/vllm/v1/worker/gpu_model_runner.py:4099。
+        # 这一层负责：
+        # - 根据 SchedulerOutput 更新请求状态；
+        # - 准备 input IDs、positions；
+        # - 构造 slot mapping、block table；
+        # - 构造 attention metadata；
+        # - 进入 KV connector context；
+        # - 最后调用 _model_forward()。
+
+        # CacheBlend 就是在这一层插入的。
+        # 对应顺序见 vllm/vllm/v1/worker/gpu_model_runner.py:4364：
+        # with (
+        #     set_forward_context(...),
+        #     self.maybe_get_kv_connector_output(...) as kv_connector_output,
+        # ):
+        #     model_output = self._model_forward(...)
+
+        # 进入 maybe_get_kv_connector_output() 时，会先调用：
+        # kv_connector.start_load_kv(get_forward_context())
+        # 见 vllm/vllm/v1/worker/kv_connector_model_runner_mixin.py:78。
+        # 因此完整调用链为：
+        # EngineCore
+        #     → ModelExecutor
+        #     → GPUWorker.execute_model()           gpu_worker.py:1012
+        #         → GPUModelRunner.execute_model()    gpu_model_runner.py:4099
+        #         → KVConnector.start_load_kv()
+        #             → LMCache blender.blend()
+        #             → blend_layer()
+        #         → GPUModelRunner._model_forward()
+
+        # 所以：
+        # - GPUWorker.execute_model()：worker 层的总入口和 PP 通信协调器；
+        # - GPUModelRunner.execute_model()：一次 GPU batch 的实际组织者；
+        # - blend_layer()：在 ModelRunner 的 connector 阶段执行；
+        # - _model_forward()：LMCache Blend 完成后执行的普通 vLLM forward。
         if self._pp_send_work:
             for handle in self._pp_send_work:
                 handle.wait()

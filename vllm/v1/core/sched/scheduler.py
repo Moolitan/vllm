@@ -449,7 +449,7 @@ class Scheduler(SchedulerInterface):
         state = self._segmentia_lookups.get(request.request_id)
         if state is None or state.phase != "initial":
             return num_new_tokens
-        # if num_computed_tokens >= state.cursor:
+        if num_computed_tokens >= state.cursor:
             # native prefix caching (e.g. a concurrent duplicate request with
             # identical prompt content) already advanced num_computed_tokens
             # to or past cursor before this request's own scheduling caught
@@ -460,7 +460,19 @@ class Scheduler(SchedulerInterface):
             # num_new_tokens and trip the scheduler's `assert num_new_tokens
             # > 0` invariant. Stop capping instead and let this request
             # proceed as an ordinary (non-segmentia-lookup) schedule.
-            # return num_new_tokens
+            #
+            # 这条分支在并发下会被真实触发（实测：并发 >= 2 时 100% 崩在
+            # scheduler.py 的 `assert num_new_tokens > 0`）。它是**静默降级**：
+            # 该请求这一轮不再走 segmentia 复用，退回普通调度。因此这里必须打日志，
+            # 否则测出来的"复用性能"里会混进一批其实没复用的请求。
+            state.phase = "overshot_fallback"
+            _log_segmentia_lookup_event(
+                "segmentia_lookup_overshot",
+                request_id=request.request_id,
+                cursor=state.cursor,
+                num_computed_tokens=num_computed_tokens,
+            )
+            return num_new_tokens
         return min(num_new_tokens, state.cursor - num_computed_tokens)
 
     def _requeue_for_segmentia_lookup(self, request: Request) -> None:

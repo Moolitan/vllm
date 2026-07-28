@@ -92,8 +92,10 @@ def _log_segmentia_lookup_event(
 @dataclass
 class _SegmentiaLookupState:
     segment_start: int
+    segment_end: int
     cursor: int  # The stopping position P of the first local computation.
-    # initial → waiting_segmentia_lookup → lookup_complete/local_fallback
+    # initial → boundary_ready → lookup_complete/local_fallback
+    #                         └→ waiting_for_probe → ...
     phase: str = "initial"
 
 
@@ -392,6 +394,16 @@ class Scheduler(SchedulerInterface):
             raise ValueError("lmcache_segmentia_lookup requires prefix caching")
         if self.connector is None:
             raise ValueError("lmcache_segmentia_lookup requires a KV connector")
+        required_apis = (
+            "poll_segmentia_probe",
+            "activate_segmentia_probe",
+            "rollback_segmentia_activation",
+            "cancel_segmentia_probe",
+        )
+        if any(not hasattr(self.connector, name) for name in required_apis):
+            raise ValueError(
+                "lmcache_segmentia_lookup requires a Segmentia-capable KV connector"
+            )
         if self.scheduler_config.async_scheduling:
             raise ValueError(
                 "lmcache_segmentia_lookup does not support async scheduling"
@@ -428,6 +440,7 @@ class Scheduler(SchedulerInterface):
             )
         self._segmentia_lookups[request.request_id] = _SegmentiaLookupState(
             segment_start=segment_start,
+            segment_end=segment_end,
             cursor=cursor,
         )
         config["lookup_cursor"] = cursor
@@ -475,32 +488,19 @@ class Scheduler(SchedulerInterface):
             return num_new_tokens
         return min(num_new_tokens, state.cursor - num_computed_tokens)
 
-    def _requeue_for_segmentia_lookup(self, request: Request) -> None:
+    def _wait_for_segmentia_probe(self, request: Request) -> None:
         state = self._segmentia_lookups[request.request_id]
-        assert state.phase == "initial"
+        assert state.phase == "boundary_ready"
         assert request.status == RequestStatus.RUNNING
         assert request.num_computed_tokens == state.cursor
         assert request.num_in_flight_tokens == 0
 
-        # Whether this is a segmentia pause is tracked by the state phase.
-        state.phase = "waiting_segmentia_lookup"
-
-        # 该 chunk 已经完成，不再视为 in-flight prefill
+        state.phase = "waiting_for_probe"
         self._inflight_prefills.discard(request)
-
-        # 使用 PREEMPTED，是因为 waiting 准入完成后的现有代码只接受
-        # WAITING 或 PREEMPTED；但这里不执行普通 _preempt_request()
-        # 否则会 free 操作
-        request.status = RequestStatus.PREEMPTED
-
-        # 关键：
-        # 1. 不调用 _free_request_blocks()
-        # 2. 不把 num_computed_tokens 清零
-        # 3. 不增加 num_preemptions
-        # 4. 不 pin
-        self.waiting.prepend_request(request)
+        request.status = RequestStatus.WAITING_FOR_SEGMENT_LOOKUP
+        self.skipped_waiting.prepend_request(request)
         _log_segmentia_lookup_event(
-            "segmentia_lookup_requeued",
+            "segmentia_lookup_waiting",
             request.request_id,
             lookup_cursor=state.cursor,
             num_computed_tokens=request.num_computed_tokens,
@@ -513,7 +513,11 @@ class Scheduler(SchedulerInterface):
         self, request: Request, num_external_computed_tokens: int
     ) -> None:
         state = self._segmentia_lookups.get(request.request_id)
-        if state is None or state.phase != "waiting_segmentia_lookup":
+        if state is None or state.phase not in (
+            "boundary_ready",
+            "waiting_for_probe",
+            "activated",
+        ):
             return
 
         config = (request.kv_transfer_params or {})["lmcache_segmentia_lookup"]
@@ -536,7 +540,10 @@ class Scheduler(SchedulerInterface):
         )
 
     def _release_segmentia_lookup_state(self, request_id: str) -> None:
-        self._segmentia_lookups.pop(request_id, None)
+        state = self._segmentia_lookups.pop(request_id, None)
+        request = self.requests.get(request_id)
+        if state is not None and request is not None and self.connector is not None:
+            self.connector.cancel_segmentia_probe(request)
 
     def _mamba_block_aligned_split(
         self,
@@ -625,6 +632,7 @@ class Scheduler(SchedulerInterface):
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
         preempted_reqs: list[Request] = []
+        segmentia_deferred_this_step: set[str] = set()
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
@@ -656,6 +664,31 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            num_external_computed_tokens = 0
+            segmentia_state = self._segmentia_lookups.get(request.request_id)
+            if (
+                segmentia_state is not None
+                and segmentia_state.phase == "boundary_ready"
+            ):
+                matched_end = self.connector.poll_segmentia_probe(request)
+                if matched_end is None:
+                    self.running.pop(req_index)
+                    self._wait_for_segmentia_probe(request)
+                    segmentia_deferred_this_step.add(request.request_id)
+                    continue
+                if matched_end <= segmentia_state.cursor:
+                    self.connector.cancel_segmentia_probe(request)
+                    self._finish_segmentia_lookup(request, 0)
+                else:
+                    num_external_computed_tokens = (
+                        self.connector.activate_segmentia_probe(
+                            request, request.num_computed_tokens
+                        )
+                    )
+                    if num_external_computed_tokens > 0:
+                        segmentia_state.phase = "activated"
+                    else:
+                        self._finish_segmentia_lookup(request, 0)
 
             if (
                 request.num_output_placeholders > 0
@@ -689,6 +722,7 @@ class Scheduler(SchedulerInterface):
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
                 - request.num_computed_tokens
+                - num_external_computed_tokens
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
@@ -700,6 +734,7 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens,
                 self.max_model_len
                 - request.num_computed_tokens
+                - num_external_computed_tokens
                 - self.num_sampled_tokens_per_step,
             )
             num_new_tokens = self._limit_segmentia_lookup_chunk(
@@ -754,6 +789,9 @@ class Scheduler(SchedulerInterface):
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_external_computed_tokens=(
+                            num_external_computed_tokens
+                        ),
                     )
 
                     if new_blocks is not None:
@@ -797,7 +835,24 @@ class Scheduler(SchedulerInterface):
 
             if new_blocks is None:
                 # Cannot schedule this request.
+                if (
+                    num_external_computed_tokens > 0
+                    and request.request_id in self._segmentia_lookups
+                ):
+                    self.connector.rollback_segmentia_activation(request)
+                    self._finish_segmentia_lookup(request, 0)
                 break
+
+            if num_external_computed_tokens > 0:
+                self.connector.update_state_after_alloc(
+                    request,
+                    self.kv_cache_manager.get_blocks(request.request_id),
+                    num_external_computed_tokens,
+                )
+                request.num_computed_tokens += num_external_computed_tokens
+                self._finish_segmentia_lookup(
+                    request, num_external_computed_tokens
+                )
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
@@ -856,17 +911,52 @@ class Scheduler(SchedulerInterface):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
-                # in `running` but still hold a model-runner request slot.
-                num_running = len(self.running) + self.num_waiting_for_streaming_input
-                if num_running >= self.max_num_running_reqs:
-                    break
-
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
-
                 request = request_queue.peek_request()
+
+                # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
+                # in `running` but still hold a model-runner request slot.
+                num_waiting_for_segment_lookup = sum(
+                    req.status == RequestStatus.WAITING_FOR_SEGMENT_LOOKUP
+                    for req in self.requests.values()
+                )
+                num_running = (
+                    len(self.running)
+                    + self.num_waiting_for_streaming_input
+                    + num_waiting_for_segment_lookup
+                )
+                if num_running >= self.max_num_running_reqs:
+                    if (
+                        request.status
+                        != RequestStatus.WAITING_FOR_SEGMENT_LOOKUP
+                    ):
+                        # A blocked Segmentia request already owns a model
+                        # runner/KV slot. Resume it ahead of ordinary waiting
+                        # requests so priority ordering cannot strand it at
+                        # the max-sequence limit.
+                        segment_waiting = next(
+                            (
+                                req
+                                for req in self.skipped_waiting
+                                if req.status
+                                == RequestStatus.WAITING_FOR_SEGMENT_LOOKUP
+                            ),
+                            None,
+                        )
+                        if segment_waiting is None:
+                            break
+                        self.skipped_waiting.remove_requests([segment_waiting])
+                        self.skipped_waiting.prepend_request(segment_waiting)
+                        request_queue = self.skipped_waiting
+                        request = segment_waiting
+
                 request_id = request.request_id
+
+                if request_id in segmentia_deferred_this_step:
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -903,46 +993,40 @@ class Scheduler(SchedulerInterface):
                 segmentia_state = self._segmentia_lookups.get(request.request_id)
                 is_segmentia_reentry = (
                     segmentia_state is not None
-                    and segmentia_state.phase == "waiting_segmentia_lookup"
+                    and segmentia_state.phase == "waiting_for_probe"
                 )
 
                 if is_segmentia_reentry:
                     # Segmentia connector lookup after an ownership-preserving pause.
                     assert segmentia_state is not None
-                    assert request.status == RequestStatus.PREEMPTED
+                    assert (
+                        request.status
+                        == RequestStatus.WAITING_FOR_SEGMENT_LOOKUP
+                    )
                     assert request.num_computed_tokens == segmentia_state.cursor
                     assert request.num_in_flight_tokens == 0
 
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
 
-                    # connector 应从现有本地计算终点 P 开始查询
                     connector_lookup_start = request.num_computed_tokens
-
-                    connector_lookup_started = time.perf_counter_ns()
-                    ext_tokens, load_kv_async = (
-                        self.connector.get_num_new_matched_tokens(
-                            request,
-                            connector_lookup_start,
+                    matched_end = self.connector.poll_segmentia_probe(request)
+                    assert matched_end is not None
+                    if matched_end <= segmentia_state.cursor:
+                        self.connector.cancel_segmentia_probe(request)
+                        ext_tokens = 0
+                    else:
+                        ext_tokens = self.connector.activate_segmentia_probe(
+                            request, connector_lookup_start
                         )
-                    )
 
                     if _SEGMENTIA_PROFILE_ENABLED:
                         _log_segmentia_lookup_event(
                             "segmentia_profile_connector_lookup",
                             request.request_id,
-                            duration_ms=(
-                                time.perf_counter_ns() - connector_lookup_started
-                            )
-                            / 1_000_000,
                             external_tokens=ext_tokens,
                             phase=segmentia_state.phase,
                         )
-
-                    if ext_tokens is None:
-                        request_queue.pop_request()
-                        step_skipped_waiting.prepend_request(request)
-                        continue
 
                     num_external_computed_tokens = ext_tokens
                     assert num_external_computed_tokens >= 0
@@ -1011,11 +1095,20 @@ class Scheduler(SchedulerInterface):
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
-                        ext_tokens, load_kv_async = (
-                            self.connector.get_num_new_matched_tokens(
-                                request, num_new_local_computed_tokens
+                        if (
+                            segmentia_state is not None
+                            and segmentia_state.phase == "initial"
+                        ):
+                            # The admission-time Segmentia probe is the only
+                            # external query before P. Ordinary prefix lookup
+                            # here would duplicate work and may pin too early.
+                            ext_tokens = 0
+                        else:
+                            ext_tokens, load_kv_async = (
+                                self.connector.get_num_new_matched_tokens(
+                                    request, num_new_local_computed_tokens
+                                )
                             )
-                        )
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
@@ -1201,7 +1294,7 @@ class Scheduler(SchedulerInterface):
                     _SEGMENTIA_PROFILE_ENABLED
                     and request.request_id in self._segmentia_lookups
                     and self._segmentia_lookups[request.request_id].phase
-                    == "waiting_segmentia_lookup"
+                    == "waiting_for_probe"
                 ):
                     _log_segmentia_lookup_event(
                         "segmentia_profile_allocate_slots",
@@ -1210,7 +1303,7 @@ class Scheduler(SchedulerInterface):
                         / 1_000_000,
                         external_tokens=num_external_computed_tokens,
                         allocated=new_blocks is not None,
-                        phase="waiting_segmentia_lookup",
+                        phase="waiting_for_probe",
                     )
 
                 if (
@@ -1222,6 +1315,7 @@ class Scheduler(SchedulerInterface):
                     # 下面的成功本地分配会调用 update_state_after_alloc(..., 0)，该函数会清除连接器缓存的查找状态。
 
                     # 如果 LMCache 找到了复用的token，但是没有足够的 slots 接收 external KV
+                    self.connector.rollback_segmentia_activation(request)
                     self._finish_segmentia_lookup(request, 0)
                     num_external_computed_tokens = 0
                     load_kv_async = False
@@ -1339,6 +1433,8 @@ class Scheduler(SchedulerInterface):
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
+                    scheduled_resumed_reqs.append(request)
+                elif request.status == RequestStatus.WAITING_FOR_SEGMENT_LOOKUP:
                     scheduled_resumed_reqs.append(request)
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
@@ -1542,6 +1638,13 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        segmentia_state = self._segmentia_lookups.get(request.request_id)
+        if segmentia_state is not None:
+            if segmentia_state.phase == "activated":
+                self.connector.rollback_segmentia_activation(request)
+            # A genuinely preempted request loses [0, P), so it resumes as an
+            # ordinary request instead of replaying a stale boundary state.
+            self._release_segmentia_lookup_state(request.request_id)
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
@@ -1986,7 +2089,6 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set() # 正常运行中本轮结束的请求
         stopped_preempted_reqs: set[Request] = set()  # 被抢占后本轮结束的请求
-        segmentia_requeued_reqs: set[Request] = set()  # 二次检索完成需要重新排队的请求
         # 遍历本轮所有调度请求（核心大循环，性能瓶颈处）
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
@@ -2218,8 +2320,8 @@ class Scheduler(SchedulerInterface):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
-            # Forward 完成后 从 runing 到 waiting 的触发判断条件
-            # 二次检索（segmentia lookup）重排队逻辑
+            # The first local chunk has reached P. Keep the request RUNNING;
+            # the next scheduling pass consumes the already-submitted probe.
             segmentia_state = self._segmentia_lookups.get(req_id)
             if (
                 segmentia_state is not None
@@ -2230,24 +2332,21 @@ class Scheduler(SchedulerInterface):
                 and request.num_computed_tokens == segmentia_state.cursor
                 and request.num_in_flight_tokens == 0
             ):
+                segmentia_state.phase = "boundary_ready"
                 _log_segmentia_lookup_event(
-                    "segmentia_lookup_forward_complete",
+                    "segmentia_lookup_boundary_ready",
                     request.request_id,
                     lookup_cursor=segmentia_state.cursor,
                     num_computed_tokens=request.num_computed_tokens,
                     num_in_flight_tokens=request.num_in_flight_tokens,
                     phase=segmentia_state.phase,
                 )
-                self._requeue_for_segmentia_lookup(request)
-                segmentia_requeued_reqs.add(request)
 
         # Remove the stopped requests from the running and waiting queues.
         # 循环结束，清理调度队列
-        # 正常结束、二次检索重排：从running运行队列删除
+        # Remove genuinely stopped requests from the running queue.
         if stopped_running_reqs:
             self.running = remove_all(self.running, stopped_running_reqs)
-        if segmentia_requeued_reqs:
-            self.running = remove_all(self.running, segmentia_requeued_reqs)
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
@@ -2351,6 +2450,7 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
             RequestStatus.WAITING_FOR_REMOTE_KVS,
             RequestStatus.WAITING_FOR_STREAMING_REQ,
+            RequestStatus.WAITING_FOR_SEGMENT_LOOKUP,
         )
 
     def _enqueue_waiting_request(self, request: Request) -> None:
@@ -2978,6 +3078,12 @@ class Scheduler(SchedulerInterface):
         Try to promote a blocked waiting request back to schedulable states.
         尝试把处于阻塞等待状态的请求，解除阻塞、切换回可被调度的正常等待状态（WAITING / PREEMPTED），返回是否成功解除阻塞
         """
+        if request.status == RequestStatus.WAITING_FOR_SEGMENT_LOOKUP:
+            # Leave the dedicated status intact. The waiting scheduling path
+            # activates the ready result and changes the request to RUNNING
+            # only after slot allocation succeeds.
+            return self.connector.poll_segmentia_probe(request) is not None
+
         if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
             # finished_recving_kv_req_ids is populated during
             # update_from_output(), based on worker-side connector signals

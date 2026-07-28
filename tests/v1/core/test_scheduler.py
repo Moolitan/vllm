@@ -70,7 +70,7 @@ def _make_local_opt_config(tmp_path) -> str:
     return str(model_dir)
 
 
-def test_segmentia_lookup_requeues_with_owned_blocks_and_skips_apc(
+def test_segmentia_lookup_miss_stays_running_with_owned_blocks_and_skips_apc(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
@@ -88,7 +88,7 @@ def test_segmentia_lookup_requeues_with_owned_blocks_and_skips_apc(
         block_size=block_size,
         req_ids=["segmentia"],
     )
-    config = {"segment_start": 33, "probe_only": True}
+    config = {"segment_start": 33, "segment_end": 65}
     request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
     scheduler.add_request(request)
 
@@ -102,13 +102,13 @@ def test_segmentia_lookup_requeues_with_owned_blocks_and_skips_apc(
     scheduler.update_from_output(first, _empty_model_runner_output(request))
 
     state = scheduler._segmentia_lookups[request.request_id]
-    assert request.status == RequestStatus.PREEMPTED
+    assert request.status == RequestStatus.RUNNING
     assert request.num_computed_tokens == 48
     assert request.num_in_flight_tokens == 0
-    assert state.phase == "waiting_segmentia_lookup"
-    retained_blocks = scheduler.kv_cache_manager.get_blocks(
-        request.request_id
-    ).blocks[0]
+    assert state.phase == "boundary_ready"
+    retained_blocks = list(
+        scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[0]
+    )
     assert len(retained_blocks) == 3
     assert all(block.ref_cnt == 1 for block in retained_blocks)
 
@@ -131,7 +131,56 @@ def test_segmentia_lookup_requeues_with_owned_blocks_and_skips_apc(
     assert all(block.ref_cnt == 0 for block in attached)
 
 
-def test_segmentia_lookup_requires_explicit_mode(tmp_path, monkeypatch):
+def test_segmentia_pending_uses_dedicated_wait_without_preemption(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
+    scheduler = create_scheduler(
+        model=_make_local_opt_config(tmp_path),
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+        block_size=16,
+        skip_tokenizer_init=True,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=80,
+        block_size=16,
+        req_ids=["segmentia-pending"],
+    )
+    request.kv_transfer_params = {
+        "lmcache_segmentia_lookup": {"segment_start": 33, "segment_end": 65}
+    }
+    scheduler.connector.poll_segmentia_probe = Mock(
+        side_effect=[None, 65, 65]
+    )
+    scheduler.connector.activate_segmentia_probe = Mock(return_value=16)
+    scheduler.add_request(request)
+
+    first = scheduler.schedule()
+    scheduler.update_from_output(first, _empty_model_runner_output(request))
+    retained_blocks = list(
+        scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[0]
+    )
+
+    pending = scheduler.schedule()
+    assert request.request_id not in pending.num_scheduled_tokens
+    assert request.status == RequestStatus.WAITING_FOR_SEGMENT_LOOKUP
+    assert request.num_computed_tokens == 48
+    assert request.num_preemptions == 0
+    assert list(
+        scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[0]
+    ) == retained_blocks
+
+    resumed = scheduler.schedule()
+    assert resumed.num_scheduled_tokens[request.request_id] == 16
+    assert request.status == RequestStatus.RUNNING
+    assert request.num_preemptions == 0
+
+
+def test_segmentia_lookup_does_not_require_legacy_probe_only_flag(
+    tmp_path, monkeypatch
+):
     monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
     scheduler = create_scheduler(
         model=_make_local_opt_config(tmp_path),
@@ -141,11 +190,11 @@ def test_segmentia_lookup_requires_explicit_mode(tmp_path, monkeypatch):
     )
     (request,) = create_requests(num_requests=1, num_tokens=80)
     request.kv_transfer_params = {
-        "lmcache_segmentia_lookup": {"segment_start": 33}
+        "lmcache_segmentia_lookup": {"segment_start": 33, "segment_end": 65}
     }
 
-    with pytest.raises(ValueError, match="probe_only must be an explicit bool"):
-        scheduler.add_request(request)
+    scheduler.add_request(request)
+    assert request.request_id in scheduler._segmentia_lookups
 
 
 def test_segmentia_lookup_accepts_explicit_apply_mode(tmp_path, monkeypatch):
@@ -158,7 +207,7 @@ def test_segmentia_lookup_accepts_explicit_apply_mode(tmp_path, monkeypatch):
         skip_tokenizer_init=True,
     )
     (request,) = create_requests(num_requests=1, num_tokens=80, block_size=16)
-    config = {"segment_start": 33, "segment_end": 65, "probe_only": False}
+    config = {"segment_start": 33, "segment_end": 65}
     request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
 
     scheduler.add_request(request)
@@ -179,7 +228,7 @@ def test_segmentia_lookup_apply_requires_segment_end(tmp_path, monkeypatch):
     )
     (request,) = create_requests(num_requests=1, num_tokens=80, block_size=16)
     request.kv_transfer_params = {
-        "lmcache_segmentia_lookup": {"segment_start": 33, "probe_only": False}
+        "lmcache_segmentia_lookup": {"segment_start": 33}
     }
 
     with pytest.raises(ValueError, match="segment_end must be an int"):
@@ -193,7 +242,7 @@ def test_segmentia_lookup_applies_external_tokens_after_retained_prefix(
     scheduler = create_scheduler(
         model=_make_local_opt_config(tmp_path),
         enable_prefix_caching=True,
-        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+        use_kv_connector=mock_kv(matched_tokens=16, is_async=False),
         block_size=16,
         skip_tokenizer_init=True,
     )
@@ -203,20 +252,16 @@ def test_segmentia_lookup_applies_external_tokens_after_retained_prefix(
         block_size=16,
         req_ids=["segmentia-fallback"],
     )
-    config = {"segment_start": 33, "probe_only": True}
+    config = {"segment_start": 33, "segment_end": 65}
     request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
-    scheduler.connector.get_num_new_matched_tokens.side_effect = [
-        (0, False),
-        (16, False),
-    ]
     scheduler.add_request(request)
 
     first = scheduler.schedule()
     scheduler.update_from_output(first, _empty_model_runner_output(request))
     state = scheduler._segmentia_lookups[request.request_id]
-    retained_blocks = scheduler.kv_cache_manager.get_blocks(
-        request.request_id
-    ).blocks[0]
+    retained_blocks = list(
+        scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[0]
+    )
 
     second = scheduler.schedule()
 
@@ -224,7 +269,6 @@ def test_segmentia_lookup_applies_external_tokens_after_retained_prefix(
     assert config["retained_local_tokens"] == 48
     assert config["external_hit_tokens"] == 16
     assert state.phase == "lookup_complete"
-    scheduler.connector.get_num_new_matched_tokens.assert_called_with(request, 48)
     attached = scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[0]
     assert attached[:3] == retained_blocks
 

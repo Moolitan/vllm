@@ -433,11 +433,67 @@ class Scheduler(SchedulerInterface):
             )
 
         alignment = math.lcm(self.hash_block_size, self.block_size)
-        cursor = (segment_start + alignment - 1) // alignment * alignment
+        correction_mode = config.get("correction_mode", "none")
+        if correction_mode not in {"none", "prefix_k_headwise"}:
+            raise ValueError(
+                "lmcache_segmentia_lookup.correction_mode must be 'none' or "
+                "'prefix_k_headwise'"
+            )
+        if correction_mode == "prefix_k_headwise":
+            cache_end = config.get("cache_end")
+            if (
+                isinstance(cache_end, bool)
+                or not isinstance(cache_end, int)
+                or not segment_start < cache_end <= segment_end
+            ):
+                raise ValueError(
+                    "prefix_k_headwise requires cache_end inside the segment"
+                )
+            frozen_policy = {
+                "prefix_tokens": 256,
+                "calibration_start": 132,
+                "calibration_end": 256,
+                "minimum_reuse_tokens": 256,
+            }
+            for name, expected in frozen_policy.items():
+                value = config.get(name)
+                if isinstance(value, bool) or value != expected:
+                    raise ValueError(
+                        "prefix_k_headwise requires frozen policy "
+                        f"{name}={expected}, got {value!r}"
+                    )
+            nominal_cursor = segment_start + frozen_policy["prefix_tokens"]
+        else:
+            nominal_cursor = segment_start
+        cursor = (nominal_cursor + alignment - 1) // alignment * alignment
         if cursor >= request.num_prompt_tokens:
             raise ValueError(
                 "lmcache_segmentia_lookup has no cacheable boundary before prompt end"
             )
+        if correction_mode == "prefix_k_headwise":
+            reusable_tokens = cache_end - cursor
+            config["nominal_lookup_cursor"] = nominal_cursor
+            config["lookup_cursor"] = cursor
+            config["aligned_prefix_tokens"] = cursor - segment_start
+            config["reusable_tokens"] = max(reusable_tokens, 0)
+            if reusable_tokens < config["minimum_reuse_tokens"]:
+                config["length_gate_fallback"] = True
+                params["lmcache_segmentia_decision"] = dict(config)
+                params.pop("lmcache_segmentia_lookup", None)
+                _log_segmentia_lookup_event(
+                    "segmentia_prefix_length_fallback",
+                    request.request_id,
+                    segment_start=segment_start,
+                    segment_end=segment_end,
+                    cache_end=cache_end,
+                    nominal_lookup_cursor=nominal_cursor,
+                    lookup_cursor=cursor,
+                    aligned_prefix_tokens=cursor - segment_start,
+                    reusable_tokens=max(reusable_tokens, 0),
+                    minimum_reuse_tokens=config["minimum_reuse_tokens"],
+                    phase="full_local",
+                )
+                return
         self._segmentia_lookups[request.request_id] = _SegmentiaLookupState(
             segment_start=segment_start,
             segment_end=segment_end,

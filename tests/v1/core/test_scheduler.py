@@ -217,6 +217,101 @@ def test_segmentia_lookup_accepts_explicit_apply_mode(tmp_path, monkeypatch):
     assert first.num_scheduled_tokens[request.request_id] == 48
 
 
+def test_segmentia_prefix_correction_uses_aligned_256_token_boundary(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
+    scheduler = create_scheduler(
+        model=_make_local_opt_config(tmp_path),
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+        block_size=16,
+        skip_tokenizer_init=True,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=768, block_size=16)
+    config = {
+        "segment_start": 33,
+        "segment_end": 704,
+        "cache_end": 703,
+        "correction_mode": "prefix_k_headwise",
+        "prefix_tokens": 256,
+        "calibration_start": 132,
+        "calibration_end": 256,
+        "minimum_reuse_tokens": 256,
+    }
+    request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
+
+    scheduler.add_request(request)
+    first = scheduler.schedule()
+
+    assert config["nominal_lookup_cursor"] == 289
+    assert config["lookup_cursor"] == 304
+    assert config["aligned_prefix_tokens"] == 271
+    assert config["reusable_tokens"] == 399
+    assert first.num_scheduled_tokens[request.request_id] == 304
+
+
+def test_segmentia_prefix_correction_short_skill_falls_back_before_probe(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
+    scheduler = create_scheduler(
+        model=_make_local_opt_config(tmp_path),
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+        block_size=16,
+        skip_tokenizer_init=True,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=400, block_size=16)
+    config = {
+        "segment_start": 33,
+        "segment_end": 350,
+        "cache_end": 349,
+        "correction_mode": "prefix_k_headwise",
+        "prefix_tokens": 256,
+        "calibration_start": 132,
+        "calibration_end": 256,
+        "minimum_reuse_tokens": 256,
+    }
+    request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
+
+    scheduler.add_request(request)
+
+    assert request.request_id not in scheduler._segmentia_lookups
+    assert "lmcache_segmentia_lookup" not in request.kv_transfer_params
+    decision = request.kv_transfer_params["lmcache_segmentia_decision"]
+    assert decision["length_gate_fallback"] is True
+    assert decision["aligned_prefix_tokens"] == 271
+    assert decision["reusable_tokens"] == 45
+
+
+def test_segmentia_prefix_correction_rejects_policy_drift(tmp_path, monkeypatch):
+    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
+    scheduler = create_scheduler(
+        model=_make_local_opt_config(tmp_path),
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+        block_size=16,
+        skip_tokenizer_init=True,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=768, block_size=16)
+    request.kv_transfer_params = {
+        "lmcache_segmentia_lookup": {
+            "segment_start": 33,
+            "segment_end": 704,
+            "cache_end": 703,
+            "correction_mode": "prefix_k_headwise",
+            "prefix_tokens": 128,
+            "calibration_start": 132,
+            "calibration_end": 256,
+            "minimum_reuse_tokens": 256,
+        }
+    }
+
+    with pytest.raises(ValueError, match="prefix_tokens=256"):
+        scheduler.add_request(request)
+
+
 def test_segmentia_lookup_apply_requires_segment_end(tmp_path, monkeypatch):
     monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
     scheduler = create_scheduler(

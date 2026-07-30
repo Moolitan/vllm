@@ -215,6 +215,11 @@ from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm.v1.worker.segmentia_shared_attention import (
+    SegmentiaSharedAttentionTensors,
+    SegmentiaSharedAttentionWorkspace,
+    build_segmentia_shared_attention_plan,
+)
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
@@ -722,6 +727,13 @@ class GPUModelRunner(
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             reasoning_config=self.vllm_config.reasoning_config,
         )
+        self.segmentia_shared_attention_workspace: (
+            SegmentiaSharedAttentionWorkspace | None
+        ) = None
+        self.segmentia_shared_attention_tensors: (
+            SegmentiaSharedAttentionTensors | None
+        ) = None
+        self.segmentia_shared_rope_theta: float | None = None
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
         # GPU to CPU when async scheduling is enabled.
@@ -2267,6 +2279,8 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        segmentia_shared_tensors: SegmentiaSharedAttentionTensors | None = None,
+        segmentia_rope_theta: float | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         Returns:
@@ -2412,6 +2426,8 @@ class GPUModelRunner(
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
         )
+        if segmentia_shared_tensors is not None:
+            cm_base.block_table_tensor = segmentia_shared_tensors.block_table
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
@@ -2457,9 +2473,13 @@ class GPUModelRunner(
             cache_key = (kv_cache_spec, type(builder))
 
             cascade_attn_prefix_len = (
-                cascade_attn_prefix_lens[kv_cache_gid][attn_gid]
-                if cascade_attn_prefix_lens
-                else 0
+                segmentia_shared_tensors.shared_token_count
+                if segmentia_shared_tensors is not None
+                else (
+                    cascade_attn_prefix_lens[kv_cache_gid][attn_gid]
+                    if cascade_attn_prefix_lens
+                    else 0
+                )
             )
 
             extra_attn_metadata_args = {}
@@ -2518,7 +2538,24 @@ class GPUModelRunner(
                 attn_metadata_dict = attn_metadata[ubid]
 
             for layer_name in attn_group.layer_names:
-                attn_metadata_dict[layer_name] = attn_metadata_i
+                layer_metadata = attn_metadata_i
+                if segmentia_shared_tensors is not None:
+                    if not hasattr(layer_metadata, "segmentia_k_offset"):
+                        raise RuntimeError(
+                            "Segmentia shared attention requires FlashAttention"
+                        )
+                    layer_metadata = copy(layer_metadata)
+                    layer_metadata.segmentia_query_request_indices = (
+                        segmentia_shared_tensors.query_request_indices
+                    )
+                    layer_metadata.segmentia_shared_start_positions = (
+                        segmentia_shared_tensors.shared_start_positions
+                    )
+                    layer_metadata.segmentia_rope_theta = segmentia_rope_theta
+                    layer_metadata.segmentia_k_offset = (
+                        segmentia_shared_tensors.k_offsets_by_layer[layer_name]
+                    )
+                attn_metadata_dict[layer_name] = layer_metadata
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
@@ -2581,6 +2618,108 @@ class GPUModelRunner(
             )
 
         return attn_metadata, spec_decode_common_attn_metadata
+
+    def _prepare_segmentia_shared_attention(
+        self,
+        scheduler_output: "SchedulerOutput",
+        *,
+        num_reqs: int,
+        use_spec_decode: bool,
+        should_ubatch: bool,
+        cudagraph_mode: CUDAGraphMode,
+    ) -> SegmentiaSharedAttentionTensors | None:
+        """Stage the separate read-only table without changing KV write state."""
+        batch = scheduler_output.segmentia_shared_kv
+        if batch is None:
+            self.segmentia_shared_attention_tensors = None
+            self.segmentia_shared_rope_theta = None
+            return None
+        if len(self.kv_cache_config.kv_cache_groups) != 1:
+            raise RuntimeError("Segmentia shared attention requires one KV group")
+        if self.dcp_world_size != 1:
+            raise RuntimeError("Segmentia shared attention does not support DCP")
+        if use_spec_decode:
+            raise RuntimeError(
+                "Segmentia shared attention does not support speculative decode"
+            )
+        if should_ubatch:
+            raise RuntimeError("Segmentia shared attention does not support ubatching")
+        if cudagraph_mode != CUDAGraphMode.NONE:
+            raise RuntimeError("Segmentia shared attention requires eager execution")
+
+        hf_config = self.model_config.hf_text_config
+        rope_parameters = getattr(hf_config, "rope_parameters", None) or {}
+        if (
+            hf_config.model_type != "qwen3"
+            or rope_parameters.get("rope_type", "default") != "default"
+            or rope_parameters.get("partial_rotary_factor", 1.0) != 1.0
+        ):
+            raise RuntimeError(
+                "Segmentia shared attention requires full-head Qwen3 default RoPE"
+            )
+        rope_theta = float(rope_parameters.get("rope_theta", 1_000_000.0))
+
+        normal_table = self.input_batch.block_table[0]
+        if normal_table.blocks_per_kv_block != 1:
+            raise RuntimeError(
+                "Segmentia shared attention requires identical manager/kernel blocks"
+            )
+        request_ids = tuple(self.input_batch.req_ids[:num_reqs])
+        if tuple(request.req_id for request in batch.requests) != request_ids:
+            raise RuntimeError(
+                "Segmentia shared batch order must match GPU execution order"
+            )
+        for req_idx, request in enumerate(batch.requests):
+            num_computed_tokens = int(
+                self.input_batch.num_computed_tokens_cpu[req_idx]
+            )
+            if num_computed_tokens < request.shared_end:
+                raise RuntimeError(
+                    "Segmentia shared attention requires every query after B1"
+                )
+
+        normal_table_np = normal_table.get_numpy_array()
+        normal_block_ids = {
+            req_id: normal_table_np[
+                req_idx, : normal_table.num_blocks_per_row[req_idx]
+            ].tolist()
+            for req_idx, req_id in enumerate(request_ids)
+        }
+        scheduled_tokens = {
+            req_id: scheduler_output.num_scheduled_tokens[req_id]
+            for req_id in request_ids
+        }
+        plan = build_segmentia_shared_attention_plan(
+            batch=batch,
+            normal_block_ids=normal_block_ids,
+            scheduled_tokens=scheduled_tokens,
+            block_size=normal_table.block_size,
+            null_block_id=NULL_BLOCK_ID,
+        )
+
+        workspace = self.segmentia_shared_attention_workspace
+        if workspace is None:
+            attention_layers = get_layers_from_vllm_config(
+                self.vllm_config, Attention
+            )
+            layer_shapes = {
+                layer_name: (layer.num_kv_heads, layer.head_size)
+                for layer_name, layer in attention_layers.items()
+            }
+            workspace = SegmentiaSharedAttentionWorkspace(
+                max_num_reqs=self.max_num_reqs,
+                max_num_tokens=self.max_num_tokens,
+                max_num_blocks_per_req=normal_table.max_num_blocks_per_req,
+                layer_shapes=layer_shapes,
+                device=self.device,
+                pin_memory=PIN_MEMORY,
+            )
+            self.segmentia_shared_attention_workspace = workspace
+
+        tensors = workspace.stage(plan, null_block_id=NULL_BLOCK_ID)
+        self.segmentia_shared_attention_tensors = tensors
+        self.segmentia_shared_rope_theta = rope_theta
+        return tensors
 
     def _compute_cascade_attn_prefix_lens(
         self,
@@ -4296,6 +4435,14 @@ class GPUModelRunner(
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
+            segmentia_shared_tensors = self._prepare_segmentia_shared_attention(
+                scheduler_output,
+                num_reqs=num_reqs,
+                use_spec_decode=use_spec_decode,
+                should_ubatch=should_ubatch,
+                cudagraph_mode=cudagraph_mode,
+            )
+
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
                 num_tokens_padded=num_tokens_padded
                 if pad_attn or has_separate_kv_update
@@ -4320,6 +4467,8 @@ class GPUModelRunner(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
+                    segmentia_shared_tensors=segmentia_shared_tensors,
+                    segmentia_rope_theta=self.segmentia_shared_rope_theta,
                 )
             )
 

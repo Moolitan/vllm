@@ -318,6 +318,62 @@ class SingleTypeKVCacheManager(ABC):
         if self._record_new_block_ids:
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
+    def validate_shared_null_range(
+        self, request_id: str, start_token: int, end_token: int
+    ) -> int:
+        """Validate a block-aligned virtual range appended to a request."""
+        if start_token < 0 or end_token <= start_token:
+            raise ValueError("shared virtual range must be non-empty")
+        if start_token % self.block_size or end_token % self.block_size:
+            raise ValueError("shared virtual range must be block-aligned")
+        start_block = start_token // self.block_size
+        req_blocks = self.req_to_blocks.get(request_id)
+        if req_blocks is None:
+            raise ValueError("request has no KV block table")
+        if len(req_blocks) != start_block:
+            raise ValueError(
+                "shared virtual range must start at the request block-table tail"
+            )
+        return (end_token - start_token) // self.block_size
+
+    def append_shared_null_range(
+        self, request_id: str, start_token: int, end_token: int
+    ) -> None:
+        """Append null placeholders for a non-materialized shared KV range."""
+        num_blocks = self.validate_shared_null_range(
+            request_id, start_token, end_token
+        )
+        self.req_to_blocks[request_id].extend([self._null_block] * num_blocks)
+
+    def validate_shared_null_range_for_pop(
+        self, request_id: str, start_token: int, end_token: int
+    ) -> int:
+        """Validate that a virtual shared range is still the request tail."""
+        if start_token < 0 or end_token <= start_token:
+            raise ValueError("shared virtual range must be non-empty")
+        if start_token % self.block_size or end_token % self.block_size:
+            raise ValueError("shared virtual range must be block-aligned")
+        start_block = start_token // self.block_size
+        end_block = end_token // self.block_size
+        req_blocks = self.req_to_blocks.get(request_id)
+        if req_blocks is None or len(req_blocks) != end_block:
+            raise ValueError("shared virtual range must be the block-table tail")
+        if any(block is not self._null_block for block in req_blocks[start_block:]):
+            raise ValueError("shared virtual range tail contains a real block")
+        return start_block
+
+    def pop_shared_null_range(
+        self, request_id: str, start_token: int, end_token: int
+    ) -> None:
+        """Rollback a virtual range before any later private blocks exist."""
+        start_block = self.validate_shared_null_range_for_pop(
+            request_id, start_token, end_token
+        )
+        del self.req_to_blocks[request_id][start_block:]
+        self.num_cached_block[request_id] = min(
+            self.num_cached_block.get(request_id, 0), start_block
+        )
+
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
     ) -> list[KVCacheBlock]:

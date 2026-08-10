@@ -3,6 +3,7 @@
 """Attention layer with FlashAttention."""
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -303,7 +304,7 @@ def prepare_segmentia_prefix_inputs(
     num_kv_heads: int,
     softmax_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Move Qwen3 position/K corrections to the shared attention inputs."""
+    """Move Qwen3 position and K correction to shared attention inputs."""
     request_indices = attn_metadata.segmentia_query_request_indices
     shared_starts = attn_metadata.segmentia_shared_start_positions
     rope_theta = attn_metadata.segmentia_rope_theta
@@ -971,6 +972,20 @@ class FlashAttentionImpl(AttentionImpl):
             # queries are quantized in the attention layer
             key_cache = key_cache.view(current_platform.fp8_dtype())
             value_cache = value_cache.view(current_platform.fp8_dtype())
+
+        if os.environ.get("SEGMENTIA_ATTENTION_HEATMAP_SPEC"):
+            from segmentia_attention_heatmap_probe import (
+                get_attention_heatmap_probe,
+            )
+
+            get_attention_heatmap_probe().capture(
+                layer=layer,
+                query=query[:num_actual_tokens],
+                key_cache=key_cache,
+                block_table=attn_metadata.block_table,
+                scale=self.scale,
+                use_cascade=attn_metadata.use_cascade,
+            )
 
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc

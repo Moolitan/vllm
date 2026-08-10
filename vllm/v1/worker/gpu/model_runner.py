@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -1206,6 +1207,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+            if os.environ.get("SEGMENTIA_ATTENTION_HEATMAP_SPEC"):
+                from segmentia_attention_heatmap_probe import (
+                    get_attention_heatmap_probe,
+                )
+
+                get_attention_heatmap_probe().begin_step(
+                    req_ids=input_batch.req_ids,
+                    query_start_loc=input_batch.query_start_loc_np,
+                    num_scheduled_tokens=input_batch.num_scheduled_tokens,
+                    num_computed_tokens=input_batch.num_computed_tokens_np,
+                )
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the

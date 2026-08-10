@@ -400,6 +400,7 @@ def test_scheduler_prepares_aligned_shared_bank_plan(tmp_path, monkeypatch):
         "calibration_start": 132,
         "calibration_end": 256,
         "minimum_reuse_tokens": 256,
+        "correction_alpha": 0.6,
     }
     request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
     scheduler.add_request(request)
@@ -498,6 +499,7 @@ def test_scheduler_schedules_isolated_shared_load_owner(
         "calibration_start": 132,
         "calibration_end": 256,
         "minimum_reuse_tokens": 256,
+        "correction_alpha": 0.6,
     }
     request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
     scheduler.connector.poll_segmentia_probe = Mock(side_effect=[700])
@@ -631,6 +633,7 @@ def test_scheduler_waits_for_ready_bank_then_schedules_correction_only_follower(
             "calibration_start": 132,
             "calibration_end": 256,
             "minimum_reuse_tokens": 256,
+            "correction_alpha": 0.6,
         }
 
     owner.kv_transfer_params = {
@@ -767,6 +770,7 @@ def test_scheduler_batches_same_ready_bank_followers_in_one_step(
             "calibration_start": 132,
             "calibration_end": 256,
             "minimum_reuse_tokens": 256,
+            "correction_alpha": 0.6,
         }
 
     owner.kv_transfer_params = {"lmcache_segmentia_lookup": make_config()}
@@ -919,6 +923,7 @@ def test_scheduler_caps_ready_bank_followers_before_private_kv_allocation(
             "calibration_start": 132,
             "calibration_end": 256,
             "minimum_reuse_tokens": 256,
+            "correction_alpha": 0.6,
         }
 
     owner.kv_transfer_params = {"lmcache_segmentia_lookup": make_config()}
@@ -1090,6 +1095,7 @@ def test_segmentia_prefix_correction_uses_aligned_256_token_boundary(
         "calibration_start": 132,
         "calibration_end": 256,
         "minimum_reuse_tokens": 256,
+        "correction_alpha": 0.6,
     }
     request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
 
@@ -1124,6 +1130,7 @@ def test_segmentia_prefix_correction_short_skill_falls_back_before_probe(
         "calibration_start": 132,
         "calibration_end": 256,
         "minimum_reuse_tokens": 256,
+        "correction_alpha": 0.6,
     }
     request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
 
@@ -1157,6 +1164,7 @@ def test_segmentia_prefix_correction_rejects_policy_drift(tmp_path, monkeypatch)
             "calibration_start": 132,
             "calibration_end": 256,
             "minimum_reuse_tokens": 256,
+            "correction_alpha": 0.6,
         }
     }
 

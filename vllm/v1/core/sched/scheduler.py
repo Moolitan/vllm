@@ -513,6 +513,7 @@ class Scheduler(SchedulerInterface):
                 "calibration_start": 132,
                 "calibration_end": 256,
                 "minimum_reuse_tokens": 256,
+                "correction_alpha": 0.6,
             }
             for name, expected in frozen_policy.items():
                 value = config.get(name)
@@ -726,7 +727,7 @@ class Scheduler(SchedulerInterface):
             tp_world_size=self.parallel_config.tensor_parallel_size,
             token_hash=hashlib.sha256(token_bytes).hexdigest(),
             num_tokens=shared_end - shared_start,
-            correction_version="prefix-k-headwise-v1",
+            correction_version="prefix-k-headwise-alpha0.6-v1",
         )
 
     def _expected_segmentia_shared_key(

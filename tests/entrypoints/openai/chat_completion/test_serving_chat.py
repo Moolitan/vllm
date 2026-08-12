@@ -29,10 +29,13 @@ from vllm.entrypoints.openai.chat_completion.serving import (
     OpenAIServingChat,
     _get_mm_token_counts,
     _make_prompt_tokens_details,
+    _record_structured_skill_action,
 )
 from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
+    FunctionCall,
     RequestResponseMetadata,
+    ToolCall,
 )
 from vllm.entrypoints.openai.models.serving import (
     BaseModelPath,
@@ -63,6 +66,33 @@ _PER_REQUEST_STATS = RequestStateStats(
     last_token_ts=3.0,
     num_generation_tokens=2,
 )
+
+
+def test_record_structured_skill_action_after_tool_parsing(
+    tmp_path, monkeypatch
+) -> None:
+    """A complete Skill call emits one correlation record for the batch probe."""
+    trace_path = tmp_path / "skill_action.jsonl"
+    monkeypatch.setattr(
+        "vllm.entrypoints.openai.chat_completion.serving._SKILL_ACTION_TRACE_PATH",
+        str(trace_path),
+    )
+    tool_call = ToolCall(
+        id="tool-call-1",
+        function=FunctionCall(name="skill", arguments='{"name":"docx"}'),
+    )
+
+    _record_structured_skill_action(
+        "chatcmpl-segmentia-window-request-a", tool_call, 123456, 654321
+    )
+
+    record = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert record["request_id"] == "chatcmpl-segmentia-window-request-a"
+    assert record["tool_call_id"] == "tool-call-1"
+    assert record["skill_name"] == "docx"
+    assert record["skill_action_ready_unix_ns"] == 123456
+    assert record["skill_action_ready_monotonic_ns"] == 654321
+    assert record["boot_id"]
 
 
 @pytest.fixture(scope="module")

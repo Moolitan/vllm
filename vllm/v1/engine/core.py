@@ -91,6 +91,20 @@ from vllm.version import __version__ as VLLM_VERSION
 logger = init_logger(__name__)
 _SEGMENTIA_PROFILE_ENABLED = os.getenv("SEGMENTIA_PROFILE", "0") == "1"
 _SEGMENTIA_PROFILE_MARKER = "SEGMENTIA_PROFILE_EVENT"
+_SCHEDULE_WINDOW_TRACE_PATH = os.getenv("VLLM_SCHEDULE_WINDOW_TRACE_PATH")
+_SCHEDULE_WINDOW_REQUEST_PREFIX = "chatcmpl-segmentia-window-"
+
+
+def _linux_boot_id() -> str:
+    """Identify the Linux monotonic-clock domain shared by vLLM processes."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as file:
+            return file.read().strip()
+    except OSError:
+        return "unavailable"
+
+
+_BOOT_ID = _linux_boot_id()
 
 
 def _log_segmentia_profile_event(event: str, **fields: Any) -> None:
@@ -102,6 +116,50 @@ def _log_segmentia_profile_event(event: str, **fields: Any) -> None:
         _SEGMENTIA_PROFILE_MARKER,
         json.dumps(payload, sort_keys=True, separators=(",", ":")),
     )
+
+
+def _record_schedule_window_admission(
+    request_id: str,
+    unix_ns: int,
+    monotonic_ns: int,
+    source_tool_call_id: str,
+) -> None:
+    """Append request B's timestamp immediately before scheduler admission."""
+    if (
+        not _SCHEDULE_WINDOW_TRACE_PATH
+        or not request_id.startswith(_SCHEDULE_WINDOW_REQUEST_PREFIX)
+    ):
+        return
+    external_request_id = request_id
+    stem, separator, random_suffix = request_id.rpartition("-")
+    if (
+        separator
+        and len(random_suffix) == 8
+        and all(character in "0123456789abcdef" for character in random_suffix)
+    ):
+        external_request_id = stem
+    payload = {
+        "request_id": external_request_id,
+        "engine_request_id": request_id,
+        "source_tool_call_id": source_tool_call_id,
+        "boot_id": _BOOT_ID,
+        "scheduler_admission_unix_ns": unix_ns,
+        "scheduler_admission_monotonic_ns": monotonic_ns,
+        "boundary": "immediately_before_scheduler_add_request",
+        "pid": os.getpid(),
+    }
+    encoded = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    descriptor = os.open(
+        _SCHEDULE_WINDOW_TRACE_PATH,
+        os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+        0o644,
+    )
+    try:
+        os.write(descriptor, encoded)
+    finally:
+        os.close(descriptor)
 
 
 HANDSHAKE_TIMEOUT_MINS = 5
@@ -482,7 +540,37 @@ class EngineCore:
                 "Disabling ECTransfer for this request."
             )
 
+        lookup = (request.kv_transfer_params or {}).get(
+            "lmcache_segmentia_lookup"
+        )
+        source_tool_call_id = (
+            lookup.get("source_tool_call_id")
+            if isinstance(lookup, dict)
+            else None
+        )
+        trace_schedule_window = (
+            request.request_id.startswith(_SCHEDULE_WINDOW_REQUEST_PREFIX)
+            and isinstance(source_tool_call_id, str)
+            and bool(source_tool_call_id)
+        )
+        schedule_window_unix_ns = (
+            time.time_ns() if trace_schedule_window else None
+        )
+        schedule_window_monotonic_ns = (
+            time.monotonic_ns() if trace_schedule_window else None
+        )
         self.scheduler.add_request(request)
+        if (
+            schedule_window_unix_ns is not None
+            and schedule_window_monotonic_ns is not None
+            and isinstance(source_tool_call_id, str)
+        ):
+            _record_schedule_window_admission(
+                request.request_id,
+                schedule_window_unix_ns,
+                schedule_window_monotonic_ns,
+                source_tool_call_id,
+            )
         if request.abort_immediately:
             # Immediately abort so the connector's request_finished hook runs
             # to free any pre-admission KV-transfer resources.

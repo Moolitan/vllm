@@ -21,7 +21,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import (
     KVConnectorOutput,
     ModelRunnerOutput,
-    SegmentiaSharedKVLoadResult,
 )
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -29,19 +28,6 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
-
-
-def _segmentia_shared_load_success_results(
-    scheduler_output: "SchedulerOutput",
-) -> tuple[SegmentiaSharedKVLoadResult, ...]:
-    batch = scheduler_output.segmentia_shared_kv
-    if batch is None or batch.bank_state != "loading":
-        return ()
-    owner = batch.load_owner_request_id
-    request_ids = tuple(request.req_id for request in batch.requests)
-    if owner is None or request_ids != (owner,):
-        raise RuntimeError("LOADING shared Skill batch must contain only its owner")
-    return (SegmentiaSharedKVLoadResult(owner, True),)
 
 
 # Defined as a kv connector functionality mixin for ModelRunner (GPU, TPU)
@@ -107,10 +93,8 @@ class KVConnectorModelRunnerMixin:
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
         kv_connector.start_load_kv(get_forward_context())
-        forward_completed = False
         try:
             yield output
-            forward_completed = True
         finally:
             if wait_for_save and not defer_finalize:
                 kv_connector.wait_for_save()
@@ -123,10 +107,6 @@ class KVConnectorModelRunnerMixin:
             output.kv_connector_stats = kv_connector.get_kv_connector_stats()
             output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
             output.kv_connector_worker_meta = kv_connector.build_connector_worker_meta()
-            if forward_completed:
-                output.segmentia_shared_loads = (
-                    _segmentia_shared_load_success_results(scheduler_output)
-                )
 
             if not defer_finalize:
                 kv_connector.clear_connector_metadata()

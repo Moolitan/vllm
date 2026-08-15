@@ -393,23 +393,6 @@ class MockKVConnector(KVConnectorBase_V1):
     ) -> tuple[int | None, bool]:
         return (self.config.matched_tokens, self.config.is_async)
 
-    def poll_segmentia_probe(self, request: Request) -> int | None:
-        if self.config.is_async:
-            return None
-        config = request.kv_transfer_params["lmcache_segmentia_lookup"]
-        return config["segment_end"] if self.config.matched_tokens > 0 else 0
-
-    def activate_segmentia_probe(
-        self, request: Request, num_computed_tokens: int
-    ) -> int:
-        return self.config.matched_tokens
-
-    def rollback_segmentia_activation(self, request: Request) -> None:
-        pass
-
-    def cancel_segmentia_probe(self, request: Request) -> None:
-        pass
-
     def update_state_after_alloc(
         self,
         request: Request,

@@ -192,13 +192,6 @@ class SamplerOutput:
     logprobs_tensors: LogprobsTensors | None
 
 
-@dataclass(frozen=True)
-class SegmentiaSharedKVLoadResult:
-    request_id: str
-    success: bool
-    failure_reason: str | None = None
-
-
 @dataclass
 class KVConnectorOutput:
     # [req_ids]
@@ -216,8 +209,6 @@ class KVConnectorOutput:
     # It captures a static setup info and should almost always remain constant
     # for a given connector after discovery. Default value entails no change.
     expected_finished_count: int = 0
-    # Completion acknowledgements for shared middle-Skill Bank loads.
-    segmentia_shared_loads: tuple[SegmentiaSharedKVLoadResult, ...] = ()
 
     def is_empty(self):
         return (
@@ -227,7 +218,6 @@ class KVConnectorOutput:
             and not self.kv_cache_events
             and not self.invalid_block_ids
             and not self.kv_connector_worker_meta
-            and not self.segmentia_shared_loads
         )
 
 

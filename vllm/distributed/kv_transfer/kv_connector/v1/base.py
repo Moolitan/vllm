@@ -534,6 +534,52 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def submit_csk_prefetch(self, ticket: str, skill_name: str) -> bool:
+        """Submit an optional Agent Skill T0 prefetch operation."""
+        return False
+
+    def inspect_csk_tool_observation(
+        self, ticket: str, tool_name: str, content: str
+    ) -> bool:
+        """Check a Tool result against an optional Agent Skill transaction."""
+        return False
+
+    def authenticate_csk_request(
+        self, ticket: str, request_id: str, prompt_token_ids: list[int]
+    ) -> dict[str, Any] | None:
+        """Authenticate and bind an optional Agent Skill transaction."""
+        return None
+
+    def prepare_csk_reuse(
+        self, ticket: str, request_id: str, block_alignment: int
+    ) -> dict[str, Any] | None:
+        """Ask CSKCache to prepare an aligned request-local reuse plan."""
+        return None
+
+    def query_csk_readiness(
+        self, ticket: str, request_id: str
+    ) -> dict[str, Any]:
+        """Query CSKCache host readiness without activating GPU reuse."""
+        return {
+            "status": "fallback",
+            "plan": None,
+            "reason": "cskcache_unavailable",
+        }
+
+    def activate_csk_reuse(
+        self, ticket: str, request_id: str
+    ) -> dict[str, Any] | None:
+        """Activate one ready CSKCache transaction on all worker ranks."""
+        return None
+
+    def release_csk_reuse(self, ticket: str) -> bool:
+        """Release one CSKCache transaction on all worker ranks."""
+        return False
+
+    def cancel_csk_prefetch(self, ticket: str, reason: str) -> None:
+        """Release an optional Agent Skill T0 transaction."""
+        return
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
         Update KVConnector state from worker-side connectors output.

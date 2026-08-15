@@ -18,6 +18,7 @@ from vllm.outputs import (
     PoolingRequestOutput,
     RequestOutput,
 )
+from vllm.request_timeline import record_request_timeline
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
 from vllm.tracing import (
@@ -639,6 +640,13 @@ class OutputProcessor:
                     req_state.num_cached_tokens = (
                         engine_core_output.prefill_stats.num_cached_tokens
                     )
+                record_request_timeline(
+                    "first_token_ready",
+                    req_state.external_req_id,
+                    engine_request_id=req_state.request_id,
+                    prompt_tokens=req_state.prompt_len,
+                    cached_tokens=req_state.num_cached_tokens,
+                )
                 req_state.is_prefilling = False
 
             if pooling_output is None:

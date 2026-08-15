@@ -187,23 +187,6 @@ class ScheduledEncoderInputStats:
     output_tokens: int = 0
 
 
-@dataclass(frozen=True)
-class SegmentiaSharedRequestData:
-    req_id: str
-    shared_start: int
-    shared_end: int
-
-
-@dataclass(frozen=True)
-class SegmentiaSharedKVBatchData:
-    bank_key: str
-    shared_block_ids: tuple[int, ...]
-    shared_token_count: int
-    requests: tuple[SegmentiaSharedRequestData, ...]
-    bank_state: str = "ready"
-    load_owner_request_id: str | None = None
-
-
 @dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
@@ -275,10 +258,6 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
-
-    # Optional non-materialized middle-Skill KV view. The normal request block
-    # tables remain authoritative for KV writes and slot mapping.
-    segmentia_shared_kv: SegmentiaSharedKVBatchData | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

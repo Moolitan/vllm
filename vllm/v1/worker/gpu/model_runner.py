@@ -19,7 +19,6 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
-import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -827,28 +826,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
-        staged_num_computed_update = False
         for req_id, num_computed_tokens, req_new_block_ids in zip(
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
         ):
             req_index = self.req_states.req_id_to_index[req_id]
-            if num_computed_tokens_np[req_index] != num_computed_tokens:
-                # Usually the GPU state advances in postprocess together with
-                # the scheduler. External KV activation is different: the
-                # scheduler can jump over a loaded range without a model step.
-                # Reconcile that discontinuity before preparing this forward.
-                self.req_states.num_computed_tokens.stage_write_elem(
-                    req_index, num_computed_tokens
-                )
-                staged_num_computed_update = True
             num_computed_tokens_np[req_index] = num_computed_tokens
             if req_new_block_ids is not None:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
-
-        if staged_num_computed_update:
-            self.req_states.num_computed_tokens.apply_write()
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(
@@ -1207,17 +1193,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
-            if os.environ.get("SEGMENTIA_ATTENTION_HEATMAP_SPEC"):
-                from segmentia_attention_heatmap_probe import (
-                    get_attention_heatmap_probe,
-                )
-
-                get_attention_heatmap_probe().begin_step(
-                    req_ids=input_batch.req_ids,
-                    query_start_loc=input_batch.query_start_loc_np,
-                    num_scheduled_tokens=input_batch.num_scheduled_tokens,
-                    num_computed_tokens=input_batch.num_computed_tokens_np,
-                )
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the

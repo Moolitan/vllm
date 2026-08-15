@@ -348,6 +348,7 @@ class RequestStatus(enum.IntEnum):
     WAITING_FOR_REMOTE_KVS = enum.auto()
     WAITING_FOR_STREAMING_REQ = enum.auto()
     WAITING_FOR_SEGMENT_LOOKUP = enum.auto()
+    WAITING_FOR_CSKCACHE = enum.auto()
     RUNNING = enum.auto()
     PREEMPTED = enum.auto()
     # Note: anything after PREEMPTED will be considered

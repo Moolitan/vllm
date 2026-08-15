@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import math
 from unittest.mock import Mock
 
 import pytest
@@ -32,19 +33,13 @@ from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.core.segmentia_shared_kv import SharedSkillKVKey, SharedSkillKVState
 from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
 )
-from vllm.v1.outputs import (
-    DraftTokenIds,
-    KVConnectorOutput,
-    ModelRunnerOutput,
-    SegmentiaSharedKVLoadResult,
-)
+from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -91,68 +86,95 @@ def _make_local_opt_config(tmp_path) -> str:
     return str(model_dir)
 
 
-def test_segmentia_lookup_miss_stays_running_with_owned_blocks_and_skips_apc(
-    tmp_path, monkeypatch
-):
+def _attach_cskcache_plan(scheduler, request, *, status="ready"):
+    alignment = math.lcm(scheduler.hash_block_size, scheduler.block_size)
+    reuse_start = (368 + alignment - 1) // alignment * alignment
+    reuse_end = 992 // alignment * alignment
+    source_reuse_start = 268
+    plan = {
+        "ticket": "call-csk-1",
+        "cache_object_id": "skill:v1:model",
+        "request_id": request.request_id,
+        "segment_start": 100,
+        "segment_end": 1000,
+        "reuse_start": reuse_start,
+        "reuse_end": reuse_end,
+        "source_reuse_start": source_reuse_start,
+        "source_reuse_end": source_reuse_start + reuse_end - reuse_start,
+        "calibration_start": 232,
+        "calibration_end": 356,
+        "correction_alpha": 0.6,
+        "block_alignment": alignment,
+    }
+    request.kv_transfer_params = {
+        "cskcache_verified": {
+            "ticket": plan["ticket"],
+            "cache_object_id": plan["cache_object_id"],
+            "request_id": request.request_id,
+            "segment_start": plan["segment_start"],
+            "segment_end": plan["segment_end"],
+        }
+    }
+    scheduler.connector.prepare_csk_reuse = Mock(return_value=plan)
+    scheduler.connector.query_csk_readiness = Mock(
+        return_value={"status": status, "plan": plan, "reason": None}
+    )
+    scheduler.connector.activate_csk_reuse = Mock(return_value=plan)
+    scheduler.connector.release_csk_reuse = Mock(return_value=True)
+    scheduler.connector.update_state_after_alloc = Mock(
+        wraps=scheduler.connector.update_state_after_alloc
+    )
+    return plan
+
+
+def test_cskcache_ready_reuses_only_the_aligned_suffix(tmp_path, monkeypatch):
     monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
-    block_size = 16
     scheduler = create_scheduler(
         model=_make_local_opt_config(tmp_path),
         enable_prefix_caching=True,
         use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
-        block_size=block_size,
+        block_size=16,
         skip_tokenizer_init=True,
+        max_num_batched_tokens=2048,
     )
     (request,) = create_requests(
         num_requests=1,
-        num_tokens=80,
-        block_size=block_size,
-        req_ids=["segmentia"],
+        num_tokens=1100,
+        block_size=16,
+        req_ids=["csk-ready"],
     )
-    config = {"segment_start": 33, "segment_end": 65}
-    request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
+    plan = _attach_cskcache_plan(scheduler, request)
     scheduler.add_request(request)
 
     first = scheduler.schedule()
-    assert config["lookup_cursor"] == 48
-    assert first.num_scheduled_tokens[request.request_id] == 48
-    assert request.num_computed_tokens == 48
-    assert request.num_in_flight_tokens == 48
-    assert scheduler._segmentia_lookups[request.request_id].phase == "initial"
-
+    assert first.num_scheduled_tokens[request.request_id] == plan["reuse_start"]
     scheduler.update_from_output(first, _empty_model_runner_output(request))
-
-    state = scheduler._segmentia_lookups[request.request_id]
-    assert request.status == RequestStatus.RUNNING
-    assert request.num_computed_tokens == 48
-    assert request.num_in_flight_tokens == 0
-    assert state.phase == "boundary_ready"
-    retained_blocks = list(
-        scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[0]
-    )
-    assert len(retained_blocks) == 3
-    assert all(block.ref_cnt == 1 for block in retained_blocks)
-
-    scheduler.kv_cache_manager.get_computed_blocks = Mock(
-        side_effect=AssertionError("segmentia reentry must skip APC lookup")
-    )
+    assert scheduler._cskcache_reuses[request.request_id].phase == "waiting"
+    assert request.status == RequestStatus.WAITING_FOR_CSKCACHE
 
     second = scheduler.schedule()
-
-    assert second.num_scheduled_tokens[request.request_id] == 32
-    assert config["retained_local_tokens"] == 48
-    assert config["external_hit_tokens"] == 0
-    assert state.phase == "local_fallback"
-    attached = scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[0]
-    assert attached[:3] == retained_blocks
-    assert all(block.ref_cnt == 1 for block in attached)
+    assert second.num_scheduled_tokens[request.request_id] == 1100 - plan["reuse_end"]
+    # vLLM advances both the externally installed range and this step's local
+    # prompt suffix when it builds SchedulerOutput.
+    assert request.num_computed_tokens == 1100
+    scheduler.connector.activate_csk_reuse.assert_called_once_with(
+        plan["ticket"], request.request_id
+    )
+    scheduler.connector.update_state_after_alloc.assert_called_with(
+        request,
+        scheduler.kv_cache_manager.get_blocks(request.request_id),
+        plan["reuse_end"] - plan["reuse_start"],
+    )
+    assert (
+        scheduler._cskcache_reuses[request.request_id].host_lease_owner
+        == "worker"
+    )
 
     scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
-    assert request.request_id not in scheduler._segmentia_lookups
-    assert all(block.ref_cnt == 0 for block in attached)
+    scheduler.connector.release_csk_reuse.assert_not_called()
 
 
-def test_segmentia_pending_uses_dedicated_wait_without_preemption(
+def test_cskcache_loading_waits_with_owned_prefix_then_resumes(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
@@ -162,44 +184,43 @@ def test_segmentia_pending_uses_dedicated_wait_without_preemption(
         use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
         block_size=16,
         skip_tokenizer_init=True,
+        max_num_batched_tokens=2048,
     )
     (request,) = create_requests(
         num_requests=1,
-        num_tokens=80,
+        num_tokens=1100,
         block_size=16,
-        req_ids=["segmentia-pending"],
+        req_ids=["csk-loading"],
     )
-    request.kv_transfer_params = {
-        "lmcache_segmentia_lookup": {"segment_start": 33, "segment_end": 65}
-    }
-    scheduler.connector.poll_segmentia_probe = Mock(
-        side_effect=[None, 65, 65]
+    plan = _attach_cskcache_plan(scheduler, request)
+    scheduler.connector.query_csk_readiness = Mock(
+        side_effect=[
+            {"status": "loading", "plan": plan, "reason": None},
+            {"status": "ready", "plan": plan, "reason": None},
+        ]
     )
-    scheduler.connector.activate_segmentia_probe = Mock(return_value=16)
     scheduler.add_request(request)
-
     first = scheduler.schedule()
     scheduler.update_from_output(first, _empty_model_runner_output(request))
-    retained_blocks = list(
+    retained = list(
         scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[0]
     )
 
     pending = scheduler.schedule()
     assert request.request_id not in pending.num_scheduled_tokens
-    assert request.status == RequestStatus.WAITING_FOR_SEGMENT_LOOKUP
-    assert request.num_computed_tokens == 48
+    assert request.status == RequestStatus.WAITING_FOR_CSKCACHE
     assert request.num_preemptions == 0
     assert list(
         scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[0]
-    ) == retained_blocks
+    ) == retained
 
     resumed = scheduler.schedule()
-    assert resumed.num_scheduled_tokens[request.request_id] == 16
+    assert resumed.num_scheduled_tokens[request.request_id] == 108
     assert request.status == RequestStatus.RUNNING
     assert request.num_preemptions == 0
 
 
-def test_segmentia_lookup_does_not_require_legacy_probe_only_flag(
+def test_cskcache_abort_while_loading_releases_scheduler_lease_once(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
@@ -207,1025 +228,62 @@ def test_segmentia_lookup_does_not_require_legacy_probe_only_flag(
         model=_make_local_opt_config(tmp_path),
         enable_prefix_caching=True,
         use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
-        skip_tokenizer_init=True,
-    )
-    (request,) = create_requests(num_requests=1, num_tokens=80)
-    request.kv_transfer_params = {
-        "lmcache_segmentia_lookup": {"segment_start": 33, "segment_end": 65}
-    }
-
-    scheduler.add_request(request)
-    assert request.request_id in scheduler._segmentia_lookups
-
-
-def test_segmentia_lookup_release_also_releases_shared_kv_lease(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
-    monkeypatch.setenv("VLLM_SEGMENTIA_SHARED_KV", "1")
-    scheduler = create_scheduler(
-        model=_make_local_opt_config(tmp_path),
-        enable_prefix_caching=True,
-        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
         block_size=16,
         skip_tokenizer_init=True,
-    )
-    (request,) = create_requests(num_requests=1, num_tokens=80, block_size=16)
-    request.kv_transfer_params = {
-        "lmcache_segmentia_lookup": {"segment_start": 33, "segment_end": 65}
-    }
-    scheduler.add_request(request)
-    bank = scheduler._segmentia_shared_kv_bank
-    assert bank is not None
-    key = SharedSkillKVKey(
-        model_fingerprint="qwen3-14b",
-        kv_dtype="bfloat16",
-        kv_layout="paged-kv-v1",
-        block_size=16,
-        tp_world_size=1,
-        token_hash="skill-a",
-        num_tokens=32,
-        correction_version="prefix-k-v1",
-    )
-    lease = bank.acquire(key, request.request_id, num_blocks_per_group=2)
-    assert lease is not None
-    bank.mark_loading(lease)
-    bank.mark_ready(lease)
-    bank.bind_request_range(lease, 32, 64)
-
-    scheduler._release_segmentia_lookup_state(request.request_id)
-
-    entry = bank.get(key)
-    assert entry is not None and entry.lease_count == 0
-    assert bank.get_for_request(request.request_id) is None
-    assert bank.get_request_binding(request.request_id) is None
-
-
-def test_scheduler_builds_only_homogeneous_ready_shared_batch(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
-    monkeypatch.setenv("VLLM_SEGMENTIA_SHARED_KV", "1")
-    scheduler = create_scheduler(
-        model=_make_local_opt_config(tmp_path),
-        enable_prefix_caching=True,
-        block_size=16,
-        skip_tokenizer_init=True,
-    )
-    bank = scheduler._segmentia_shared_kv_bank
-    assert bank is not None
-    key = SharedSkillKVKey(
-        model_fingerprint="qwen3-14b",
-        kv_dtype="bfloat16",
-        kv_layout="paged-kv-v1",
-        block_size=16,
-        tp_world_size=1,
-        token_hash="skill-a",
-        num_tokens=32,
-        correction_version="prefix-k-v1",
-    )
-    owner = bank.acquire(key, "request-0", num_blocks_per_group=2)
-    follower = bank.acquire(key, "request-1", num_blocks_per_group=2)
-    assert owner is not None and follower is not None
-    bank.bind_request_range(owner, 32, 64)
-    bank.bind_request_range(follower, 48, 80)
-    with pytest.raises(RuntimeError, match="not usable"):
-        scheduler._build_segmentia_shared_kv_batch(("request-0", "request-1"))
-    bank.mark_loading(owner)
-    with pytest.raises(RuntimeError, match="only its load owner"):
-        scheduler._build_segmentia_shared_kv_batch(("request-0", "request-1"))
-    loading_batch = scheduler._build_segmentia_shared_kv_batch(("request-0",))
-    assert loading_batch is not None
-    assert loading_batch.bank_state == "loading"
-    assert loading_batch.load_owner_request_id == "request-0"
-    bank.mark_ready(owner)
-
-    batch = scheduler._build_segmentia_shared_kv_batch(
-        ("request-1", "request-0")
-    )
-
-    assert batch is not None
-    assert batch.shared_block_ids == bank.get(key).block_ids[0]
-    assert batch.bank_state == "ready"
-    assert batch.load_owner_request_id is None
-    assert [request.req_id for request in batch.requests] == [
-        "request-1",
-        "request-0",
-    ]
-    assert [request.shared_start for request in batch.requests] == [48, 32]
-
-    with pytest.raises(RuntimeError, match="whole scheduled batch"):
-        scheduler._build_segmentia_shared_kv_batch(("request-0", "ordinary"))
-
-    other_key = dataclasses.replace(key, token_hash="skill-b")
-    other = bank.acquire(other_key, "request-2", num_blocks_per_group=2)
-    assert other is not None
-    bank.bind_request_range(other, 64, 96)
-    bank.mark_loading(other)
-    bank.mark_ready(other)
-    with pytest.raises(RuntimeError, match="one Bank key"):
-        scheduler._build_segmentia_shared_kv_batch(("request-0", "request-2"))
-
-
-def test_scheduler_applies_shared_bank_success_and_failure_ack(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
-    monkeypatch.setenv("VLLM_SEGMENTIA_SHARED_KV", "1")
-    scheduler = create_scheduler(
-        model=_make_local_opt_config(tmp_path),
-        enable_prefix_caching=True,
-        block_size=16,
-        skip_tokenizer_init=True,
-    )
-    bank = scheduler._segmentia_shared_kv_bank
-    assert bank is not None
-    key = SharedSkillKVKey(
-        model_fingerprint="qwen3-14b",
-        kv_dtype="bfloat16",
-        kv_layout="paged-kv-v1",
-        block_size=16,
-        tp_world_size=1,
-        token_hash="skill-success",
-        num_tokens=32,
-        correction_version="prefix-k-v1",
-    )
-    owner = bank.acquire(key, "owner-success", 2)
-    assert owner is not None
-    bank.mark_loading(owner)
-    scheduler._apply_segmentia_shared_load_results(
-        KVConnectorOutput(
-            segmentia_shared_loads=(
-                SegmentiaSharedKVLoadResult("owner-success", True),
-            )
-        )
-    )
-    assert bank.get(key).state == SharedSkillKVState.READY
-
-    failed_key = dataclasses.replace(key, token_hash="skill-failure")
-    failed_owner = bank.acquire(failed_key, "owner-failure", 2)
-    assert failed_owner is not None
-    bank.mark_loading(failed_owner)
-    scheduler._apply_segmentia_shared_load_results(
-        KVConnectorOutput(
-            segmentia_shared_loads=(
-                SegmentiaSharedKVLoadResult(
-                    "owner-failure", False, "synthetic H2D failure"
-                ),
-            )
-        )
-    )
-    assert bank.get(failed_key) is None
-
-
-def test_scheduler_prepares_aligned_shared_bank_plan(tmp_path, monkeypatch):
-    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
-    monkeypatch.setenv("VLLM_SEGMENTIA_SHARED_KV", "1")
-    scheduler = create_scheduler(
-        model=_make_local_opt_config(tmp_path),
-        enable_prefix_caching=True,
-        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
-        block_size=16,
-        skip_tokenizer_init=True,
-    )
-    (request,) = create_requests(
-        num_requests=1, num_tokens=768, block_size=16, req_ids=["owner"]
-    )
-    config = {
-        "segment_start": 33,
-        "segment_end": 704,
-        "cache_end": 703,
-        "correction_mode": "prefix_k_headwise",
-        "prefix_tokens": 256,
-        "calibration_start": 132,
-        "calibration_end": 256,
-        "minimum_reuse_tokens": 256,
-        "correction_alpha": 0.6,
-    }
-    request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
-    scheduler.add_request(request)
-    prefix_blocks = scheduler.kv_cache_manager.allocate_slots(
-        request,
-        num_new_tokens=304,
-        has_scheduled_reqs=False,
-    )
-    assert prefix_blocks is not None
-
-    plan = scheduler._prepare_segmentia_shared_bank_plan(
-        request, matched_end=700
-    )
-
-    assert plan is not None
-    assert plan.shared_start == 304
-    assert plan.shared_end == 688
-    assert plan.lease.is_load_owner
-    assert plan.load_bank
-    assert not plan.wait_for_ready
-    bank = scheduler._segmentia_shared_kv_bank
-    assert bank is not None
-    entry = bank.get(plan.lease.key)
-    assert entry is not None
-    assert entry.state == SharedSkillKVState.LOADING
-    assert plan.lease.key.num_tokens == 384
-    assert len(plan.lease.key.token_hash) == 64
-
-    scheduler._install_segmentia_shared_bank_plan(plan)
-    binding = bank.get_request_binding(request.request_id)
-    assert binding is not None
-    assert (binding.shared_start, binding.shared_end) == (304, 688)
-    (installed_block_ids,) = scheduler.kv_cache_manager.get_block_ids(
-        request.request_id
-    )
-    assert len(installed_block_ids) == 688 // 16
-
-    scheduler._rollback_segmentia_shared_bank_plan(plan)
-    assert bank.get_request_binding(request.request_id) is None
-    (rolled_back_block_ids,) = scheduler.kv_cache_manager.get_block_ids(
-        request.request_id
-    )
-    assert len(rolled_back_block_ids) == 304 // 16
-    assert bank.get(plan.lease.key) is None
-
-    failed_plan = scheduler._prepare_segmentia_shared_bank_plan(
-        request, matched_end=700
-    )
-    assert failed_plan is not None
-
-    def fail_binding(*args, **kwargs):
-        raise RuntimeError("injected binding failure")
-
-    monkeypatch.setattr(bank, "bind_request_range", fail_binding)
-    with pytest.raises(RuntimeError, match="injected binding failure"):
-        scheduler._install_segmentia_shared_bank_plan(failed_plan)
-    (failure_block_ids,) = scheduler.kv_cache_manager.get_block_ids(
-        request.request_id
-    )
-    assert len(failure_block_ids) == 304 // 16
-    assert bank.get(failed_plan.lease.key) is None
-
-
-@pytest.mark.parametrize(
-    ("activated_tokens", "expected_scheduled_tokens", "expect_shared"),
-    [(384, 80, True), (383, 464, False)],
-)
-def test_scheduler_schedules_isolated_shared_load_owner(
-    tmp_path,
-    monkeypatch,
-    activated_tokens,
-    expected_scheduled_tokens,
-    expect_shared,
-):
-    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
-    monkeypatch.setenv("VLLM_SEGMENTIA_SHARED_KV", "1")
-    scheduler = create_scheduler(
-        model=_make_local_opt_config(tmp_path),
-        enable_prefix_caching=True,
-        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
-        block_size=16,
-        skip_tokenizer_init=True,
+        max_num_batched_tokens=2048,
     )
     (request,) = create_requests(
         num_requests=1,
-        num_tokens=768,
+        num_tokens=1100,
         block_size=16,
-        req_ids=["shared-owner"],
+        req_ids=["csk-loading-abort"],
     )
-    config = {
-        "segment_start": 33,
-        "segment_end": 704,
-        "cache_end": 703,
-        "correction_mode": "prefix_k_headwise",
-        "prefix_tokens": 256,
-        "calibration_start": 132,
-        "calibration_end": 256,
-        "minimum_reuse_tokens": 256,
-        "correction_alpha": 0.6,
-    }
-    request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
-    scheduler.connector.poll_segmentia_probe = Mock(side_effect=[700])
-
-    def activate_owner(req, num_computed_tokens):
-        assert req is request
-        assert num_computed_tokens == 304
-        assert config["shared_load_end"] == 688
-        return activated_tokens
-
-    scheduler.connector.activate_segmentia_probe = Mock(
-        side_effect=activate_owner
+    plan = _attach_cskcache_plan(scheduler, request)
+    scheduler.connector.query_csk_readiness = Mock(
+        return_value={"status": "loading", "plan": plan, "reason": None}
     )
     scheduler.add_request(request)
-
-    first = scheduler.schedule()
-    assert first.num_scheduled_tokens[request.request_id] == 304
-    scheduler.update_from_output(first, _empty_model_runner_output(request))
-
-    pending = scheduler.schedule()
-    assert request.request_id not in pending.num_scheduled_tokens
-    assert request.status == RequestStatus.WAITING_FOR_SEGMENT_LOOKUP
-
-    owner = scheduler.schedule()
-
-    assert scheduler.connector.poll_segmentia_probe.call_count == 1
-    assert owner.num_scheduled_tokens == {
-        request.request_id: expected_scheduled_tokens
-    }
-    committed_tokens = 688 if expect_shared else 304
-    assert owner.scheduled_cached_reqs.num_computed_tokens == [committed_tokens]
-    assert request.num_computed_tokens == committed_tokens + expected_scheduled_tokens
-    assert request.num_in_flight_tokens == expected_scheduled_tokens
-    assert (
-        request.num_computed_tokens - request.num_in_flight_tokens
-        == committed_tokens
-    )
-    if expect_shared:
-        assert owner.segmentia_shared_kv is not None
-        assert owner.segmentia_shared_kv.bank_state == "loading"
-        assert (
-            owner.segmentia_shared_kv.load_owner_request_id
-            == request.request_id
-        )
-        assert owner.segmentia_shared_kv.shared_token_count == 384
-        assert owner.segmentia_shared_kv.requests[0].shared_start == 304
-        assert owner.segmentia_shared_kv.requests[0].shared_end == 688
-        assert config["external_hit_tokens"] == 384
-        assert config["shared_load_end"] == 688
-
-        # Reproduce the real GPU closure boundary: the Bank load succeeds in
-        # the same model step that samples the owner's final token. READY must
-        # be committed before request cleanup releases the owner lease.
-        bank = scheduler._segmentia_shared_kv_bank
-        assert bank is not None
-        loading_entry = bank.get_for_request(request.request_id)
-        assert loading_entry is not None
-        resident_key = loading_entry.key
-        model_output = _empty_model_runner_output(request)
-        model_output.sampled_token_ids = [[EOS_TOKEN_ID]]
-        model_output.kv_connector_output = KVConnectorOutput(
-            segmentia_shared_loads=(
-                SegmentiaSharedKVLoadResult(request.request_id, True),
-            )
-        )
-        scheduler.update_from_output(owner, model_output)
-
-        assert request.is_finished()
-        entry = bank.get_for_request(request.request_id)
-        assert entry is None
-        resident = bank.get(resident_key)
-        assert resident is not None
-        assert resident.state == SharedSkillKVState.READY
-        assert resident.lease_count == 0
-        follower = bank.acquire(
-            resident.key,
-            "post-owner-follower",
-            len(resident.block_ids[0]),
-        )
-        assert follower is not None and not follower.is_load_owner
-        assert bank.get(follower.key) is resident
-        assert bank.release(follower.request_id)
-    else:
-        assert owner.segmentia_shared_kv is None
-        assert config["external_hit_tokens"] == 0
-        assert "shared_load_end" not in config
-        bank = scheduler._segmentia_shared_kv_bank
-        assert bank is not None
-        assert bank.get_request_binding(request.request_id) is None
-
-
-@pytest.mark.parametrize(
-    ("activated_tokens", "expected_scheduled_tokens", "expect_shared"),
-    [(384, 80, True), (383, 464, False)],
-)
-def test_scheduler_waits_for_ready_bank_then_schedules_correction_only_follower(
-    tmp_path,
-    monkeypatch,
-    activated_tokens,
-    expected_scheduled_tokens,
-    expect_shared,
-):
-    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
-    monkeypatch.setenv("VLLM_SEGMENTIA_SHARED_KV", "1")
-    event_log = Mock()
-    monkeypatch.setattr(
-        scheduler_module, "_log_segmentia_lookup_event", event_log
-    )
-    scheduler = create_scheduler(
-        model=_make_local_opt_config(tmp_path),
-        enable_prefix_caching=True,
-        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
-        block_size=16,
-        skip_tokenizer_init=True,
-    )
-    owner, follower = create_requests(
-        num_requests=2,
-        num_tokens=768,
-        block_size=16,
-        req_ids=["bank-owner", "bank-follower"],
-        same_prompt=True,
-    )
-
-    def make_config():
-        return {
-            "segment_start": 33,
-            "segment_end": 704,
-            "cache_end": 703,
-            "correction_mode": "prefix_k_headwise",
-            "prefix_tokens": 256,
-            "calibration_start": 132,
-            "calibration_end": 256,
-            "minimum_reuse_tokens": 256,
-            "correction_alpha": 0.6,
-        }
-
-    owner.kv_transfer_params = {
-        "lmcache_segmentia_lookup": make_config()
-    }
-    follower_config = make_config()
-    follower.kv_transfer_params = {
-        "lmcache_segmentia_lookup": follower_config
-    }
-
-    scheduler.add_request(owner)
-    scheduler.waiting.remove_request(owner)
-    owner_plan = scheduler._prepare_segmentia_shared_bank_plan(
-        owner, matched_end=700
-    )
-    assert owner_plan is not None and owner_plan.load_bank
-    bank = scheduler._segmentia_shared_kv_bank
-    assert bank is not None
-    owner_entry = bank.get(owner_plan.lease.key)
-    assert owner_entry is not None
-    owner_blocks = owner_entry.block_ids
-
-    scheduler.connector.poll_segmentia_probe = Mock(side_effect=[700])
-
-    def activate_follower(req, num_computed_tokens):
-        assert req is follower
-        assert num_computed_tokens == 304
-        assert follower_config["shared_load_end"] == 688
-        assert follower_config["shared_bank_correction_only"] is True
-        return activated_tokens
-
-    scheduler.connector.activate_segmentia_probe = Mock(
-        side_effect=activate_follower
-    )
-    scheduler.add_request(follower)
-
-    first = scheduler.schedule()
-    assert first.num_scheduled_tokens == {follower.request_id: 304}
-    scheduler.update_from_output(first, _empty_model_runner_output(follower))
-
-    boundary = scheduler.schedule()
-    assert follower.request_id not in boundary.num_scheduled_tokens
-    assert follower.status == RequestStatus.WAITING_FOR_SEGMENT_LOOKUP
-
-    loading_wait = scheduler.schedule()
-    assert follower.request_id not in loading_wait.num_scheduled_tokens
-    assert bank.get_request_binding(follower.request_id) is None
-    state = scheduler._segmentia_lookups[follower.request_id]
-    assert state.ready_matched_end == 700
-
-    bank.mark_ready(owner_plan.lease)
-    ready = scheduler.schedule()
-
-    assert ready.num_scheduled_tokens == {
-        follower.request_id: expected_scheduled_tokens
-    }
-    if expect_shared:
-        assert ready.segmentia_shared_kv is not None
-        assert ready.segmentia_shared_kv.bank_state == "ready"
-        assert ready.segmentia_shared_kv.load_owner_request_id is None
-        assert ready.segmentia_shared_kv.shared_block_ids == owner_blocks[0]
-        assert follower_config["external_hit_tokens"] == 384
-        assert follower_config["shared_bank_correction_only"] is True
-        follower_entry = bank.get_for_request(follower.request_id)
-        assert follower_entry is not None
-        assert follower_entry.state == SharedSkillKVState.READY
-        activate_events = [
-            call
-            for call in event_log.call_args_list
-            if call.args[0] == "segmentia_shared_bank_activate"
-        ]
-        assert len(activate_events) == 1
-        assert activate_events[0].kwargs["lease_count"] == 2
-        scheduler._release_segmentia_lookup_state(follower.request_id)
-        release_events = [
-            call
-            for call in event_log.call_args_list
-            if call.args[0] == "segmentia_shared_bank_release"
-        ]
-        assert len(release_events) == 1
-        assert release_events[0].kwargs["bank_state"] == "ready"
-        assert release_events[0].kwargs["lease_count"] == 1
-    else:
-        assert ready.segmentia_shared_kv is None
-        assert follower_config["external_hit_tokens"] == 0
-        assert "shared_bank_correction_only" not in follower_config
-        assert "shared_load_end" not in follower_config
-        assert bank.get_for_request(follower.request_id) is None
-
-
-def test_scheduler_batches_same_ready_bank_followers_in_one_step(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
-    monkeypatch.setenv("VLLM_SEGMENTIA_SHARED_KV", "1")
-    monkeypatch.setenv("VLLM_SEGMENTIA_SHARED_KV_PRE_P_CAP", "2")
-    event_log = Mock()
-    monkeypatch.setattr(
-        scheduler_module, "_log_segmentia_lookup_event", event_log
-    )
-    scheduler = create_scheduler(
-        model=_make_local_opt_config(tmp_path),
-        enable_prefix_caching=True,
-        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
-        block_size=16,
-        skip_tokenizer_init=True,
-    )
-    owner, follower_0, follower_1 = create_requests(
-        num_requests=3,
-        num_tokens=768,
-        block_size=16,
-        req_ids=["bank-owner", "bank-follower-0", "bank-follower-1"],
-        same_prompt=True,
-    )
-    # Match the real concurrency case: followers have pairwise-distinct
-    # private prefixes but identical Skill tokens from P onward. Without this
-    # distinction, ordinary prefix caching lets the second synthetic request
-    # skip the Segmentia boundary entirely.
-    for follower_index, follower in enumerate((follower_0, follower_1)):
-        private_prefix = [100 + follower_index] * 304
-        assert follower.prompt_token_ids is not None
-        follower.prompt_token_ids[:304] = private_prefix
-        follower._all_token_ids[:304] = private_prefix
-        follower.block_hashes.clear()
-        follower.update_block_hashes()
-
-    def make_config():
-        return {
-            "segment_start": 33,
-            "segment_end": 704,
-            "cache_end": 703,
-            "correction_mode": "prefix_k_headwise",
-            "prefix_tokens": 256,
-            "calibration_start": 132,
-            "calibration_end": 256,
-            "minimum_reuse_tokens": 256,
-            "correction_alpha": 0.6,
-        }
-
-    owner.kv_transfer_params = {"lmcache_segmentia_lookup": make_config()}
-    follower_configs = [make_config(), make_config()]
-    followers = [follower_0, follower_1]
-    for follower, config in zip(followers, follower_configs, strict=True):
-        follower.kv_transfer_params = {"lmcache_segmentia_lookup": config}
-
-    scheduler.add_request(owner)
-    scheduler.waiting.remove_request(owner)
-    owner_plan = scheduler._prepare_segmentia_shared_bank_plan(
-        owner, matched_end=700
-    )
-    assert owner_plan is not None and owner_plan.load_bank
-    bank = scheduler._segmentia_shared_kv_bank
-    assert bank is not None
-    owner_entry = bank.get(owner_plan.lease.key)
-    assert owner_entry is not None
-    owner_blocks = owner_entry.block_ids[0]
-
-    scheduler.connector.poll_segmentia_probe = Mock(side_effect=[700, 700])
-
-    def activate_follower(req, num_computed_tokens):
-        follower_index = followers.index(req)
-        config = follower_configs[follower_index]
-        assert num_computed_tokens == 304
-        assert config["shared_load_end"] == 688
-        assert config["shared_bank_correction_only"] is True
-        return 384
-
-    scheduler.connector.activate_segmentia_probe = Mock(
-        side_effect=activate_follower
-    )
-    for follower in followers:
-        scheduler.add_request(follower)
-
-    first = scheduler.schedule()
-    assert first.num_scheduled_tokens == {
-        follower.request_id: 304 for follower in followers
-    }
-    scheduler.update_from_output(
-        first, _empty_model_runner_output_many(followers)
-    )
-
-    boundary = scheduler.schedule()
-    assert not boundary.num_scheduled_tokens
-    assert all(
-        follower.status == RequestStatus.WAITING_FOR_SEGMENT_LOOKUP
-        for follower in followers
-    )
-
-    loading_wait = scheduler.schedule()
-    assert not loading_wait.num_scheduled_tokens
-    assert all(
-        scheduler._segmentia_lookups[follower.request_id].ready_matched_end
-        == 700
-        for follower in followers
-    )
-
-    # Reproduce the reverse-order mixed batch from the GPU cap=2 failure:
-    # READY followers enter the step first, followed by a new ordinary pre-P
-    # request for the same Skill. The ordinary request must be deferred before
-    # it acquires admission or private blocks.
-    (ordinary,) = create_requests(
-        num_requests=1,
-        num_tokens=768,
-        block_size=16,
-        req_ids=["ordinary-after-shared"],
-    )
-    assert ordinary.prompt_token_ids is not None
-    ordinary.prompt_token_ids[:304] = [777] * 304
-    ordinary._all_token_ids[:304] = [777] * 304
-    ordinary.block_hashes.clear()
-    ordinary.update_block_hashes()
-    ordinary.kv_transfer_params = {
-        "lmcache_segmentia_lookup": make_config()
-    }
-    scheduler.add_request(ordinary)
-
-    bank.mark_ready(owner_plan.lease)
-    bank.release(owner.request_id)
-    ready = scheduler.schedule()
-
-    assert ready.num_scheduled_tokens == {
-        follower.request_id: 80 for follower in followers
-    }
-    assert ready.segmentia_shared_kv is not None
-    assert ready.segmentia_shared_kv.bank_state == "ready"
-    assert ready.segmentia_shared_kv.shared_block_ids == owner_blocks
-    assert [
-        request.req_id for request in ready.segmentia_shared_kv.requests
-    ] == list(ready.num_scheduled_tokens)
-    activate_events = [
-        call
-        for call in event_log.call_args_list
-        if call.args[0] == "segmentia_shared_bank_activate"
-    ]
-    assert [call.kwargs["lease_count"] for call in activate_events] == [1, 2]
-    assert all(
-        bank.get_for_request(follower.request_id) is not None
-        for follower in followers
-    )
-    assert ordinary.request_id not in ready.num_scheduled_tokens
-    assert ordinary.status == RequestStatus.WAITING
-    assert (
-        ordinary.request_id
-        not in scheduler._segmentia_shared_pre_p_reservations
-    )
-    for manager in scheduler.kv_cache_manager.coordinator.single_type_managers:
-        assert ordinary.request_id not in manager.req_to_blocks
-
-
-def test_scheduler_caps_ready_bank_followers_before_private_kv_allocation(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
-    monkeypatch.setenv("VLLM_SEGMENTIA_SHARED_KV", "1")
-    monkeypatch.setenv("VLLM_SEGMENTIA_SHARED_KV_PRE_P_CAP", "2")
-    event_log = Mock()
-    monkeypatch.setattr(
-        scheduler_module, "_log_segmentia_lookup_event", event_log
-    )
-    scheduler = create_scheduler(
-        model=_make_local_opt_config(tmp_path),
-        enable_prefix_caching=True,
-        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
-        block_size=16,
-        skip_tokenizer_init=True,
-    )
-    owner, *followers = create_requests(
-        num_requests=4,
-        num_tokens=768,
-        block_size=16,
-        req_ids=[
-            "cap-owner",
-            "cap-follower-0",
-            "cap-follower-1",
-            "cap-follower-2",
-        ],
-        same_prompt=True,
-    )
-
-    def make_config():
-        return {
-            "segment_start": 33,
-            "segment_end": 704,
-            "cache_end": 703,
-            "correction_mode": "prefix_k_headwise",
-            "prefix_tokens": 256,
-            "calibration_start": 132,
-            "calibration_end": 256,
-            "minimum_reuse_tokens": 256,
-            "correction_alpha": 0.6,
-        }
-
-    owner.kv_transfer_params = {"lmcache_segmentia_lookup": make_config()}
-    scheduler.add_request(owner)
-    scheduler.waiting.remove_request(owner)
-    owner_plan = scheduler._prepare_segmentia_shared_bank_plan(
-        owner, matched_end=700
-    )
-    assert owner_plan is not None and owner_plan.load_bank
-    bank = scheduler._segmentia_shared_kv_bank
-    assert bank is not None
-    bank.mark_ready(owner_plan.lease)
-    bank.release(owner.request_id)
-
-    for index, follower in enumerate(followers):
-        private_prefix = [100 + index] * 304
-        assert follower.prompt_token_ids is not None
-        follower.prompt_token_ids[:304] = private_prefix
-        follower._all_token_ids[:304] = private_prefix
-        follower.block_hashes.clear()
-        follower.update_block_hashes()
-        follower.kv_transfer_params = {
-            "lmcache_segmentia_lookup": make_config()
-        }
-        scheduler.add_request(follower)
-
-    first = scheduler.schedule()
-
-    assert set(first.num_scheduled_tokens) == {
-        followers[0].request_id,
-        followers[1].request_id,
-    }
-    assert all(
-        first.num_scheduled_tokens[follower.request_id] == 304
-        for follower in followers[:2]
-    )
-    deferred = followers[2]
-    assert deferred.status == RequestStatus.WAITING
-    assert deferred.request_id not in scheduler._segmentia_shared_pre_p_reservations
-    for manager in scheduler.kv_cache_manager.coordinator.single_type_managers:
-        assert deferred.request_id not in manager.req_to_blocks
-    ready_entry = bank.get(owner_plan.lease.key)
-    assert ready_entry is not None and ready_entry.lease_count == 0
-    assert scheduler._segmentia_shared_pre_p_admitted_by_key[
-        owner_plan.lease.key
-    ] == {follower.request_id for follower in followers[:2]}
-
-    admit_events = [
-        call
-        for call in event_log.call_args_list
-        if call.args[0] == "segmentia_shared_pre_p_admit"
-    ]
-    wait_events = [
-        call
-        for call in event_log.call_args_list
-        if call.args[0] == "segmentia_shared_pre_p_wait"
-    ]
-    assert [call.kwargs["reservation_count"] for call in admit_events] == [1, 2]
-    assert len(wait_events) == 1
-    assert wait_events[0].args[1] == deferred.request_id
-    assert wait_events[0].kwargs["private_blocks"] == 19
-
-    admitted_plan = scheduler._prepare_segmentia_shared_bank_plan(
-        followers[0], matched_end=700
-    )
-    assert admitted_plan is not None
-    assert not admitted_plan.load_bank and not admitted_plan.wait_for_ready
-    # Reproduce the real GPU failure: a candidate Bank lease can be released
-    # when this request cannot join the current shared batch. Its private
-    # [0, P) KV is still live, so durable admission must continue to block the
-    # third request.
-    bank.release(followers[0].request_id)
-    assert not scheduler._try_reserve_segmentia_shared_pre_p(deferred)
-    assert (
-        scheduler._segmentia_shared_pre_p_reservations[followers[0].request_id]
-        == owner_plan.lease.key
-    )
-    admitted_plan = scheduler._prepare_segmentia_shared_bank_plan(
-        followers[0], matched_end=700
-    )
-    assert admitted_plan is not None
-    scheduler._install_segmentia_shared_bank_plan(admitted_plan)
-    assert (
-        followers[0].request_id
-        in scheduler._segmentia_shared_pre_p_reservations
-    )
-    assert bank.get_request_binding(followers[0].request_id) is not None
-    scheduler._rollback_segmentia_shared_bank_plan(admitted_plan)
-    assert (
-        followers[0].request_id
-        in scheduler._segmentia_shared_pre_p_reservations
-    )
-
-    scheduler.finish_requests(
-        followers[0].request_id, RequestStatus.FINISHED_ABORTED
-    )
-    second = scheduler.schedule()
-
-    assert second.num_scheduled_tokens[deferred.request_id] == 304
-    assert deferred.request_id in scheduler._segmentia_shared_pre_p_reservations
-    ready_entry = bank.get(owner_plan.lease.key)
-    assert ready_entry is not None and ready_entry.lease_count == 0
-    assert scheduler._segmentia_shared_pre_p_admitted_by_key[
-        owner_plan.lease.key
-    ] == {followers[1].request_id, deferred.request_id}
-    deferred_admit = [
-        call
-        for call in event_log.call_args_list
-        if call.args[0] == "segmentia_shared_pre_p_admit"
-        and call.args[1] == deferred.request_id
-    ]
-    assert len(deferred_admit) == 1
-    assert deferred_admit[0].kwargs["wait_ms"] >= 0
-
-
-def test_scheduler_rejects_pre_p_cap_without_shared_bank(tmp_path, monkeypatch):
-    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
-    monkeypatch.setenv("VLLM_SEGMENTIA_SHARED_KV", "0")
-    monkeypatch.setenv("VLLM_SEGMENTIA_SHARED_KV_PRE_P_CAP", "2")
-
-    with pytest.raises(ValueError, match="requires VLLM_SEGMENTIA_SHARED_KV=1"):
-        create_scheduler(
-            model=_make_local_opt_config(tmp_path),
-            enable_prefix_caching=True,
-            use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
-            block_size=16,
-            skip_tokenizer_init=True,
-        )
-
-
-def test_segmentia_lookup_accepts_explicit_apply_mode(tmp_path, monkeypatch):
-    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
-    scheduler = create_scheduler(
-        model=_make_local_opt_config(tmp_path),
-        enable_prefix_caching=True,
-        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
-        block_size=16,
-        skip_tokenizer_init=True,
-    )
-    (request,) = create_requests(num_requests=1, num_tokens=80, block_size=16)
-    config = {"segment_start": 33, "segment_end": 65}
-    request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
-
-    scheduler.add_request(request)
-    first = scheduler.schedule()
-
-    assert config["lookup_cursor"] == 48
-    assert first.num_scheduled_tokens[request.request_id] == 48
-
-
-def test_segmentia_prefix_correction_uses_aligned_256_token_boundary(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
-    scheduler = create_scheduler(
-        model=_make_local_opt_config(tmp_path),
-        enable_prefix_caching=True,
-        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
-        block_size=16,
-        skip_tokenizer_init=True,
-    )
-    (request,) = create_requests(num_requests=1, num_tokens=768, block_size=16)
-    config = {
-        "segment_start": 33,
-        "segment_end": 704,
-        "cache_end": 703,
-        "correction_mode": "prefix_k_headwise",
-        "prefix_tokens": 256,
-        "calibration_start": 132,
-        "calibration_end": 256,
-        "minimum_reuse_tokens": 256,
-        "correction_alpha": 0.6,
-    }
-    request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
-
-    scheduler.add_request(request)
-    first = scheduler.schedule()
-
-    assert config["nominal_lookup_cursor"] == 289
-    assert config["lookup_cursor"] == 304
-    assert config["aligned_prefix_tokens"] == 271
-    assert config["reusable_tokens"] == 399
-    assert first.num_scheduled_tokens[request.request_id] == 304
-
-
-def test_segmentia_prefix_correction_short_skill_falls_back_before_probe(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
-    scheduler = create_scheduler(
-        model=_make_local_opt_config(tmp_path),
-        enable_prefix_caching=True,
-        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
-        block_size=16,
-        skip_tokenizer_init=True,
-    )
-    (request,) = create_requests(num_requests=1, num_tokens=400, block_size=16)
-    config = {
-        "segment_start": 33,
-        "segment_end": 350,
-        "cache_end": 349,
-        "correction_mode": "prefix_k_headwise",
-        "prefix_tokens": 256,
-        "calibration_start": 132,
-        "calibration_end": 256,
-        "minimum_reuse_tokens": 256,
-        "correction_alpha": 0.6,
-    }
-    request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
-
-    scheduler.add_request(request)
-
-    assert request.request_id not in scheduler._segmentia_lookups
-    assert "lmcache_segmentia_lookup" not in request.kv_transfer_params
-    decision = request.kv_transfer_params["lmcache_segmentia_decision"]
-    assert decision["length_gate_fallback"] is True
-    assert decision["aligned_prefix_tokens"] == 271
-    assert decision["reusable_tokens"] == 45
-
-
-def test_segmentia_prefix_correction_rejects_policy_drift(tmp_path, monkeypatch):
-    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
-    scheduler = create_scheduler(
-        model=_make_local_opt_config(tmp_path),
-        enable_prefix_caching=True,
-        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
-        block_size=16,
-        skip_tokenizer_init=True,
-    )
-    (request,) = create_requests(num_requests=1, num_tokens=768, block_size=16)
-    request.kv_transfer_params = {
-        "lmcache_segmentia_lookup": {
-            "segment_start": 33,
-            "segment_end": 704,
-            "cache_end": 703,
-            "correction_mode": "prefix_k_headwise",
-            "prefix_tokens": 128,
-            "calibration_start": 132,
-            "calibration_end": 256,
-            "minimum_reuse_tokens": 256,
-            "correction_alpha": 0.6,
-        }
-    }
-
-    with pytest.raises(ValueError, match="prefix_tokens=256"):
-        scheduler.add_request(request)
-
-
-def test_segmentia_lookup_apply_requires_segment_end(tmp_path, monkeypatch):
-    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
-    scheduler = create_scheduler(
-        model=_make_local_opt_config(tmp_path),
-        enable_prefix_caching=True,
-        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
-        block_size=16,
-        skip_tokenizer_init=True,
-    )
-    (request,) = create_requests(num_requests=1, num_tokens=80, block_size=16)
-    request.kv_transfer_params = {
-        "lmcache_segmentia_lookup": {"segment_start": 33}
-    }
-
-    with pytest.raises(ValueError, match="segment_end must be an int"):
-        scheduler.add_request(request)
-
-
-def test_segmentia_lookup_applies_external_tokens_after_retained_prefix(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
-    scheduler = create_scheduler(
-        model=_make_local_opt_config(tmp_path),
-        enable_prefix_caching=True,
-        use_kv_connector=mock_kv(matched_tokens=16, is_async=False),
-        block_size=16,
-        skip_tokenizer_init=True,
-    )
-    (request,) = create_requests(
-        num_requests=1,
-        num_tokens=80,
-        block_size=16,
-        req_ids=["segmentia-fallback"],
-    )
-    config = {"segment_start": 33, "segment_end": 65}
-    request.kv_transfer_params = {"lmcache_segmentia_lookup": config}
-    scheduler.add_request(request)
-
     first = scheduler.schedule()
     scheduler.update_from_output(first, _empty_model_runner_output(request))
-    state = scheduler._segmentia_lookups[request.request_id]
-    retained_blocks = list(
-        scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[0]
+    scheduler.schedule()
+
+    assert request.status == RequestStatus.WAITING_FOR_CSKCACHE
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    scheduler.connector.release_csk_reuse.assert_called_once_with(plan["ticket"])
+
+
+def test_cskcache_fallback_continues_local_prefill_from_reuse_boundary(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
+    scheduler = create_scheduler(
+        model=_make_local_opt_config(tmp_path),
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+        block_size=16,
+        skip_tokenizer_init=True,
+        max_num_batched_tokens=2048,
     )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=1100,
+        block_size=16,
+        req_ids=["csk-fallback"],
+    )
+    plan = _attach_cskcache_plan(scheduler, request, status="fallback")
+    scheduler.connector.query_csk_readiness = Mock(
+        return_value={"status": "fallback", "plan": plan, "reason": "io_failed"}
+    )
+    scheduler.add_request(request)
+    first = scheduler.schedule()
+    scheduler.update_from_output(first, _empty_model_runner_output(request))
 
     second = scheduler.schedule()
-
-    assert second.num_scheduled_tokens[request.request_id] == 16
-    assert config["retained_local_tokens"] == 48
-    assert config["external_hit_tokens"] == 16
-    assert state.phase == "lookup_complete"
-    attached = scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[0]
-    assert attached[:3] == retained_blocks
+    assert second.num_scheduled_tokens[request.request_id] == 1100 - plan["reuse_start"]
+    scheduler.connector.activate_csk_reuse.assert_not_called()
+    assert scheduler._cskcache_reuses[request.request_id].phase == "fallback"
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    scheduler.connector.release_csk_reuse.assert_called_once_with(plan["ticket"])
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
-import hashlib
 import io
 import json
 import os
@@ -65,6 +64,7 @@ from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
 from vllm.renderers import ChatParams
 from vllm.renderers.online_renderer import OnlineRenderer
+from vllm.request_timeline import record_request_timeline
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.collection_utils import as_list
@@ -73,9 +73,53 @@ from vllm.utils.mistral import is_mistral_tool_parser
 logger = init_logger(__name__)
 
 _SKILL_ACTION_TRACE_PATH = os.getenv("VLLM_SKILL_ACTION_TRACE_PATH")
-_SKILL_LOCATOR_TRACE_PATH = os.getenv("VLLM_SEGMENTIA_SKILL_LOCATOR_TRACE_PATH")
-_SCHEDULE_WINDOW_REQUEST_PREFIX = "chatcmpl-segmentia-window-"
-_SEGMENTIA_LOCATOR_KIND = "context_segment_start_marker_v1"
+_CSK_T0_PREFETCH_ENABLED = os.getenv("VLLM_CSK_T0_PREFETCH", "0") == "1"
+_SCHEDULE_WINDOW_REQUEST_PREFIX = "chatcmpl-cskcache-window-"
+
+
+def _message_field(message: Any, name: str) -> Any:
+    if isinstance(message, dict):
+        return message.get(name)
+    return getattr(message, name, None)
+
+
+def _tool_content_text(content: Any) -> str | None:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    parts: list[str] = []
+    for item in content:
+        item_type = _message_field(item, "type")
+        text = _message_field(item, "text")
+        if item_type == "text" and isinstance(text, str):
+            parts.append(text)
+    return "\n".join(parts) if parts else None
+
+
+def _trailing_tool_observations(
+    messages: GenericSequence[Any],
+) -> list[tuple[str, str, str]]:
+    """Extract this turn's trailing Tool results."""
+    observations: list[tuple[str, str, str]] = []
+    for message in reversed(messages):
+        role = _message_field(message, "role")
+        if role != "tool":
+            break
+        ticket = _message_field(message, "tool_call_id")
+        tool_name = _message_field(message, "name")
+        raw_content = _message_field(message, "content")
+        content = _tool_content_text(raw_content)
+        if (
+            isinstance(ticket, str)
+            and ticket
+            and isinstance(tool_name, str)
+            and tool_name
+            and content is not None
+        ):
+            observations.append((ticket, tool_name, content))
+    observations.reverse()
+    return observations
 
 
 def _linux_boot_id() -> str:
@@ -90,130 +134,20 @@ def _linux_boot_id() -> str:
 _BOOT_ID = _linux_boot_id()
 
 
-def _token_ids_sha256(token_ids: GenericSequence[int]) -> str:
-    digest = hashlib.sha256()
-    for token_id in token_ids:
-        digest.update(int(token_id).to_bytes(4, "little", signed=False))
-    return digest.hexdigest()
-
-
-def _locate_segmentia_skill_span(
-    prompt_token_ids: GenericSequence[int],
-    config: dict[str, Any],
-) -> tuple[int, int]:
-    """Resolve and authenticate one cached Skill span in final prompt tokens."""
-    locator = config.get("locator")
-    if not isinstance(locator, dict):
-        raise ValueError("lmcache_segmentia_lookup.locator must be a mapping")
-    if locator.get("kind") != _SEGMENTIA_LOCATOR_KIND:
-        raise ValueError(
-            "lmcache_segmentia_lookup.locator.kind must be "
-            f"{_SEGMENTIA_LOCATOR_KIND!r}"
-        )
-
-    marker = locator.get("start_marker_token_ids")
-    if (
-        not isinstance(marker, list)
-        or not marker
-        or any(isinstance(item, bool) or not isinstance(item, int) for item in marker)
-    ):
-        raise ValueError("locator.start_marker_token_ids must be non-empty ints")
-    if locator.get("start_marker_token_count") != len(marker):
-        raise ValueError("locator.start_marker_token_count is stale")
-    if locator.get("start_marker_token_ids_sha256") != _token_ids_sha256(marker):
-        raise ValueError("locator.start_marker_token_ids_sha256 is stale")
-
-    token_count = config.get("token_count")
-    if (
-        isinstance(token_count, bool)
-        or not isinstance(token_count, int)
-        or token_count < len(marker)
-    ):
-        raise ValueError("lmcache_segmentia_lookup.token_count is invalid")
-    expected_digest = config.get("token_ids_sha256")
-    if not isinstance(expected_digest, str) or len(expected_digest) != 64:
-        raise ValueError("lmcache_segmentia_lookup.token_ids_sha256 is invalid")
-
-    marker_width = len(marker)
-    valid_starts: list[int] = []
-    last_start = len(prompt_token_ids) - token_count
-    for start in range(max(last_start + 1, 0)):
-        if list(prompt_token_ids[start : start + marker_width]) != marker:
-            continue
-        end = start + token_count
-        if _token_ids_sha256(prompt_token_ids[start:end]) == expected_digest:
-            valid_starts.append(start)
-
-    if len(valid_starts) != 1:
-        raise ValueError(
-            "lmcache_segmentia_lookup must match exactly one authenticated Skill "
-            f"span; matches={valid_starts}"
-        )
-    start = valid_starts[0]
-    end = start + token_count
-    config["segment_start"] = start
-    config["segment_end"] = end
-    if config.get("correction_mode") == "prefix_k_headwise":
-        config["cache_end"] = end
-    return start, end
-
-
-def _record_skill_locator(
-    request_id: str,
-    start_unix_ns: int,
-    end_unix_ns: int,
-    *,
-    source_tool_call_id: str,
-    request_received_monotonic_ns: int,
-    tokenization_completed_monotonic_ns: int,
-    locator_start_monotonic_ns: int,
-    locator_end_monotonic_ns: int,
-    status: str,
-    skill_name: str | None,
-    segment_start: int | None = None,
-    segment_end: int | None = None,
-    error: str | None = None,
-) -> None:
-    """Record the post-tokenization locator interval for the reuse experiment."""
-    if not _SKILL_LOCATOR_TRACE_PATH:
-        return
-    payload = {
-        "request_id": request_id,
-        "source_tool_call_id": source_tool_call_id,
-        "skill_name": skill_name,
-        "boot_id": _BOOT_ID,
-        "request_received_monotonic_ns": request_received_monotonic_ns,
-        "tokenization_completed_monotonic_ns": (
-            tokenization_completed_monotonic_ns
-        ),
-        "locator_start_monotonic_ns": locator_start_monotonic_ns,
-        "locator_end_monotonic_ns": locator_end_monotonic_ns,
-        "locator_start_unix_ns": start_unix_ns,
-        "locator_end_unix_ns": end_unix_ns,
-        "locator_duration_ms": (
-            locator_end_monotonic_ns - locator_start_monotonic_ns
-        )
-        / 1e6,
-        "segment_start": segment_start,
-        "segment_end": segment_end,
-        "status": status,
-        "error": error,
-        "boundary_start": "after_normal_chat_tokenization",
-        "boundary_end": "after_authenticated_skill_span_location",
-        "pid": os.getpid(),
-    }
-    encoded = (
-        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
-    ).encode("utf-8")
-    descriptor = os.open(
-        _SKILL_LOCATOR_TRACE_PATH,
-        os.O_APPEND | os.O_CREAT | os.O_WRONLY,
-        0o644,
-    )
+def _parse_structured_skill_action(tool_call: ToolCall) -> str | None:
+    """Return the Skill name only after the tool call is fully actionable."""
+    if tool_call.function.name != "skill":
+        return None
     try:
-        os.write(descriptor, encoded)
-    finally:
-        os.close(descriptor)
+        arguments = json.loads(tool_call.function.arguments)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    skill_name = arguments.get("name")
+    if not isinstance(skill_name, str) or not skill_name.strip():
+        return None
+    return skill_name.strip()
 
 
 def _record_structured_skill_action(
@@ -223,25 +157,17 @@ def _record_structured_skill_action(
     monotonic_ns: int,
 ) -> None:
     """Record when vLLM has a complete, actionable Skill tool call."""
-    if (
-        not _SKILL_ACTION_TRACE_PATH
-        or not request_id.startswith(_SCHEDULE_WINDOW_REQUEST_PREFIX)
-        or tool_call.function.name != "skill"
+    if not _SKILL_ACTION_TRACE_PATH or not request_id.startswith(
+        _SCHEDULE_WINDOW_REQUEST_PREFIX
     ):
         return
-    try:
-        arguments = json.loads(tool_call.function.arguments)
-    except (TypeError, json.JSONDecodeError):
-        return
-    if not isinstance(arguments, dict):
-        return
-    skill_name = arguments.get("name")
-    if not isinstance(skill_name, str) or not skill_name.strip():
+    skill_name = _parse_structured_skill_action(tool_call)
+    if skill_name is None:
         return
     payload = {
         "request_id": request_id,
         "tool_call_id": tool_call.id,
-        "skill_name": skill_name.strip(),
+        "skill_name": skill_name,
         "boot_id": _BOOT_ID,
         "skill_action_ready_unix_ns": unix_ns,
         "skill_action_ready_monotonic_ns": monotonic_ns,
@@ -443,19 +369,32 @@ class OpenAIServingChat(GenerateBaseServing):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
-        lookup = (request.kv_transfer_params or {}).get(
-            "lmcache_segmentia_lookup"
+        request_id = (
+            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
         )
-        source_tool_call_id = (
-            lookup.get("source_tool_call_id")
-            if isinstance(lookup, dict)
-            else None
-        )
-        request_received_monotonic_ns = (
-            time.monotonic_ns()
-            if isinstance(source_tool_call_id, str) and source_tool_call_id
-            else None
-        )
+        record_request_timeline("api_request_received", request_id)
+        # CSKCache control records are created by this server, never trusted
+        # from an OpenAI client.  Remove either internal key before inspecting
+        # the newly appended Tool observation below.
+        if request.kv_transfer_params:
+            transfer_params = dict(request.kv_transfer_params)
+            transfer_params.pop("cskcache_candidate", None)
+            transfer_params.pop("cskcache_verified", None)
+            request.kv_transfer_params = transfer_params or None
+        observations = _trailing_tool_observations(request.messages)
+        observation_tasks = [
+            asyncio.create_task(
+                self.engine_client.inspect_csk_tool_observation(
+                    ticket, tool_name, content
+                )
+            )
+            for ticket, tool_name, content in observations
+        ]
+        if observation_tasks:
+            # Let EngineCore enqueue CSKCache's early check before the renderer
+            # begins the normal chat-template/tokenization path.  We await the
+            # result only after tokenization, so both paths can make progress.
+            await asyncio.sleep(0)
 
         # Streaming response
         tokenizer = self.renderer.tokenizer
@@ -469,26 +408,89 @@ class OpenAIServingChat(GenerateBaseServing):
                 chat_template_kwargs=chat_template_kwargs,
                 model_config=self.model_config,
             )
+        record_request_timeline("render_tokenize_start", request_id)
         result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
+            if observation_tasks:
+                inspection_results = await asyncio.gather(
+                    *observation_tasks, return_exceptions=True
+                )
+                await asyncio.gather(
+                    *(
+                        self.engine_client.cancel_csk_prefetch(
+                            observation[0], "request_render_failed"
+                        )
+                        for observation, accepted in zip(
+                            observations, inspection_results, strict=True
+                        )
+                        if accepted is True
+                    ),
+                    return_exceptions=True,
+                )
             return result
 
         conversation, engine_inputs = result
-        tokenization_completed_monotonic_ns = (
-            time.monotonic_ns()
-            if request_received_monotonic_ns is not None
-            else None
+        rendered_prompt_tokens = sum(
+            self._extract_prompt_len(engine_input) for engine_input in engine_inputs
         )
-
-        request_id = (
-            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+        record_request_timeline(
+            "render_tokenize_complete",
+            request_id,
+            prompt_tokens=rendered_prompt_tokens,
         )
+        accepted_observations: list[tuple[str, str, str]] = []
+        if observation_tasks:
+            inspection_results = await asyncio.gather(
+                *observation_tasks, return_exceptions=True
+            )
+            accepted_observations = [
+                observation
+                for observation, accepted in zip(
+                    observations, inspection_results, strict=True
+                )
+                if accepted is True
+            ]
+            if len(accepted_observations) > 1:
+                logger.warning(
+                    "CSKCache request %s has multiple eligible Skill results; "
+                    "falling back to normal Prefill",
+                    request_id,
+                )
+                await asyncio.gather(
+                    *(
+                        self.engine_client.cancel_csk_prefetch(
+                            observation[0], "multiple_skill_observations"
+                        )
+                        for observation in accepted_observations
+                    ),
+                    return_exceptions=True,
+                )
+                accepted_observations = []
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
         lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
+
+        if len(accepted_observations) == 1:
+            ticket, _tool_name, _content = accepted_observations[0]
+            if len(engine_inputs) == 1 and request.n == 1:
+                # Final token authentication must use vLLM's randomized,
+                # EngineCore-facing request ID.  AsyncLLM creates that ID only
+                # after input processing, so carry only this server-generated
+                # ticket candidate through SamplingParams for now.
+                transfer_params = dict(request.kv_transfer_params or {})
+                transfer_params["cskcache_candidate"] = {"ticket": ticket}
+                request.kv_transfer_params = transfer_params
+            else:
+                reason = (
+                    "multiple_engine_inputs"
+                    if len(engine_inputs) != 1
+                    else "parallel_sampling_unsupported"
+                )
+                await self.engine_client.cancel_csk_prefetch(ticket, reason)
+                accepted_observations = []
 
         model_name = self.models.model_name(lora_request)
 
@@ -508,63 +510,6 @@ class OpenAIServingChat(GenerateBaseServing):
             sub_request_id = (
                 request_id if len(engine_inputs) == 1 else f"{request_id}_{i}"
             )
-
-            if isinstance(lookup, dict) and "locator" in lookup:
-                if (
-                    request_received_monotonic_ns is None
-                    or tokenization_completed_monotonic_ns is None
-                    or not isinstance(source_tool_call_id, str)
-                    or not source_tool_call_id
-                ):
-                    raise ValueError(
-                        "lmcache_segmentia_lookup.source_tool_call_id must be "
-                        "a non-empty string"
-                    )
-                locator_start_unix_ns = time.time_ns()
-                locator_start_monotonic_ns = time.monotonic_ns()
-                try:
-                    segment_start, segment_end = _locate_segmentia_skill_span(
-                        prompt_token_ids or [], lookup
-                    )
-                except ValueError as exc:
-                    locator_end_unix_ns = time.time_ns()
-                    locator_end_monotonic_ns = time.monotonic_ns()
-                    _record_skill_locator(
-                        sub_request_id,
-                        locator_start_unix_ns,
-                        locator_end_unix_ns,
-                        source_tool_call_id=source_tool_call_id,
-                        request_received_monotonic_ns=(
-                            request_received_monotonic_ns
-                        ),
-                        tokenization_completed_monotonic_ns=(
-                            tokenization_completed_monotonic_ns
-                        ),
-                        locator_start_monotonic_ns=locator_start_monotonic_ns,
-                        locator_end_monotonic_ns=locator_end_monotonic_ns,
-                        status="error",
-                        skill_name=lookup.get("skill_name"),
-                        error=str(exc),
-                    )
-                    raise
-                locator_end_unix_ns = time.time_ns()
-                locator_end_monotonic_ns = time.monotonic_ns()
-                _record_skill_locator(
-                    sub_request_id,
-                    locator_start_unix_ns,
-                    locator_end_unix_ns,
-                    source_tool_call_id=source_tool_call_id,
-                    request_received_monotonic_ns=request_received_monotonic_ns,
-                    tokenization_completed_monotonic_ns=(
-                        tokenization_completed_monotonic_ns
-                    ),
-                    locator_start_monotonic_ns=locator_start_monotonic_ns,
-                    locator_end_monotonic_ns=locator_end_monotonic_ns,
-                    status="ok",
-                    skill_name=lookup.get("skill_name"),
-                    segment_start=segment_start,
-                    segment_end=segment_end,
-                )
 
             max_tokens = get_max_tokens(
                 max_model_len,
@@ -622,6 +567,11 @@ class OpenAIServingChat(GenerateBaseServing):
                 else:
                     reasoning_ended = None
 
+                record_request_timeline(
+                    "engine_generate_created",
+                    sub_request_id,
+                    prompt_tokens=len(prompt_token_ids or []),
+                )
                 generator = self.engine_client.generate(
                     engine_input,
                     sampling_params,
@@ -1268,12 +1218,33 @@ class OpenAIServingChat(GenerateBaseServing):
             skill_action_ready_unix_ns = time.time_ns()
             skill_action_ready_monotonic_ns = time.monotonic_ns()
             for tool_call in choice_data.message.tool_calls or ():
+                skill_name = _parse_structured_skill_action(tool_call)
                 _record_structured_skill_action(
                     request_id,
                     tool_call,
                     skill_action_ready_unix_ns,
                     skill_action_ready_monotonic_ns,
                 )
+                if _CSK_T0_PREFETCH_ENABLED and skill_name is not None:
+                    try:
+                        accepted = await self.engine_client.submit_csk_prefetch(
+                            tool_call.id, skill_name
+                        )
+                    except Exception:
+                        # T0 prefetch is speculative. Its failure must not turn a
+                        # valid model response into an API failure; request B will
+                        # safely fall back to normal Prefill when no handle binds.
+                        logger.warning(
+                            "CSKCache T0 prefetch submission failed for %s",
+                            tool_call.id,
+                            exc_info=True,
+                        )
+                    else:
+                        if not accepted:
+                            logger.debug(
+                                "CSKCache T0 prefetch was not accepted for %s",
+                                tool_call.id,
+                            )
 
             choices.append(choice_data)
 
@@ -1376,6 +1347,13 @@ class OpenAIServingChat(GenerateBaseServing):
                         delta=False,
                     )
 
+        record_request_timeline(
+            "api_response_ready",
+            request_id,
+            prompt_tokens=num_prompt_tokens,
+            completion_tokens=num_generated_tokens,
+            cached_tokens=final_res.num_cached_tokens,
+        )
         return response
 
     def _get_top_logprobs(

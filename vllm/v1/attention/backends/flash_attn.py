@@ -3,7 +3,6 @@
 """Attention layer with FlashAttention."""
 
 import copy
-import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -254,13 +253,6 @@ class FlashAttentionMetadata:
     prefix_kv_lens: torch.Tensor | None
     suffix_kv_lens: torch.Tensor | None
 
-    # CSKCache shared middle-Skill attention. These fields are populated only
-    # for a homogeneous eager batch whose queries are all after the Skill.
-    segmentia_query_request_indices: torch.Tensor | None = None
-    segmentia_shared_start_positions: torch.Tensor | None = None
-    segmentia_rope_theta: float | None = None
-    segmentia_k_offset: torch.Tensor | None = None
-
     # For GQA DCP
     max_dcp_context_kv_len: int | None = None
     dcp_context_kv_lens: torch.Tensor | None = None
@@ -294,72 +286,6 @@ class FlashAttentionMetadata:
     rswa_prefix_lens: torch.Tensor | None = None
     rswa_window: int | None = None
     rswa_window_tensor: torch.Tensor | None = None
-
-
-def prepare_segmentia_prefix_inputs(
-    query: torch.Tensor,
-    attn_metadata: FlashAttentionMetadata,
-    *,
-    num_query_heads: int,
-    num_kv_heads: int,
-    softmax_scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Move Qwen3 position and K correction to shared attention inputs."""
-    request_indices = attn_metadata.segmentia_query_request_indices
-    shared_starts = attn_metadata.segmentia_shared_start_positions
-    rope_theta = attn_metadata.segmentia_rope_theta
-    k_offset = attn_metadata.segmentia_k_offset
-    if (
-        request_indices is None
-        or shared_starts is None
-        or rope_theta is None
-        or k_offset is None
-    ):
-        raise ValueError("incomplete Segmentia shared attention metadata")
-    if query.ndim != 3 or query.shape[1] != num_query_heads:
-        raise ValueError("unexpected Segmentia query shape")
-    if query.shape[-1] % 2:
-        raise ValueError("Segmentia requires an even full-head RoPE dimension")
-    if num_query_heads % num_kv_heads:
-        raise ValueError("query heads must be divisible by KV heads")
-    if request_indices.shape != (query.shape[0],):
-        raise ValueError("Segmentia query/request mapping has the wrong length")
-    if k_offset.shape[1:] != (num_kv_heads, query.shape[-1]):
-        raise ValueError("Segmentia K offset has the wrong shape")
-
-    request_starts = shared_starts.index_select(0, request_indices)
-    head_size = query.shape[-1]
-    inv_freq = 1.0 / (
-        rope_theta
-        ** (
-            torch.arange(
-                0,
-                head_size,
-                2,
-                dtype=torch.float32,
-                device=query.device,
-            )
-            / head_size
-        )
-    )
-    angles = -request_starts.float().unsqueeze(1) * inv_freq.unsqueeze(0)
-    cos = angles.cos().unsqueeze(1)
-    sin = angles.sin().unsqueeze(1)
-    query_float = query.float()
-    first, second = query_float.chunk(2, dim=-1)
-    prefix_query = torch.cat(
-        (first * cos - second * sin, second * cos + first * sin), dim=-1
-    ).to(query.dtype)
-
-    token_offsets = k_offset.index_select(0, request_indices)
-    token_offsets = token_offsets.repeat_interleave(
-        num_query_heads // num_kv_heads, dim=1
-    )
-    prefix_lse_bias = (
-        torch.einsum("thd,thd->th", query_float, token_offsets.float())
-        * softmax_scale
-    ).transpose(0, 1)
-    return prefix_query, prefix_lse_bias
 
 
 def _get_sliding_window_configs(
@@ -973,20 +899,6 @@ class FlashAttentionImpl(AttentionImpl):
             key_cache = key_cache.view(current_platform.fp8_dtype())
             value_cache = value_cache.view(current_platform.fp8_dtype())
 
-        if os.environ.get("SEGMENTIA_ATTENTION_HEATMAP_SPEC"):
-            from segmentia_attention_heatmap_probe import (
-                get_attention_heatmap_probe,
-            )
-
-            get_attention_heatmap_probe().capture(
-                layer=layer,
-                query=query[:num_actual_tokens],
-                key_cache=key_cache,
-                block_table=attn_metadata.block_table,
-                scale=self.scale,
-                use_cascade=attn_metadata.use_cascade,
-            )
-
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc
             seqused_k = attn_metadata.seq_lens
@@ -1127,26 +1039,6 @@ class FlashAttentionImpl(AttentionImpl):
                 )
                 return output
 
-        prefix_query = None
-        prefix_lse_bias = None
-        if attn_metadata.segmentia_query_request_indices is not None:
-            if (
-                self.alibi_slopes is not None
-                or self.sliding_window != (-1, -1)
-                or self.logits_soft_cap != 0
-                or self.sinks is not None
-            ):
-                raise RuntimeError(
-                    "Segmentia shared attention requires plain full attention"
-                )
-            prefix_query, prefix_lse_bias = prepare_segmentia_prefix_inputs(
-                query[:num_actual_tokens],
-                attn_metadata,
-                num_query_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                softmax_scale=self.scale,
-            )
-
         # Cascade attention (rare case).
         cascade_attention(
             output[:num_actual_tokens],
@@ -1173,8 +1065,6 @@ class FlashAttentionImpl(AttentionImpl):
             k_descale=layer._k_scale,
             v_descale=layer._v_scale,
             s_aux=self.sinks,
-            prefix_query=prefix_query,
-            prefix_lse_bias=prefix_lse_bias,
         )
         return output
 
@@ -1704,8 +1594,6 @@ def cascade_attention(
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
     s_aux: torch.Tensor | None = None,
-    prefix_query: torch.Tensor | None = None,
-    prefix_lse_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert alibi_slopes is None, "Cascade attention does not support ALiBi."
     # TODO: Support sliding window.
@@ -1720,23 +1608,9 @@ def cascade_attention(
     assert num_common_kv_blocks > 0
     descale_shape = (cu_prefix_query_lens.shape[0] - 1, key_cache.shape[-2])
 
-    if prefix_query is None:
-        prefix_query = query
-    else:
-        assert prefix_query.shape == query.shape, (
-            "prefix_query must have the same shape as query"
-        )
-    if prefix_lse_bias is not None:
-        assert logits_soft_cap == 0, (
-            "prefix_lse_bias is only exact when logits soft cap is disabled"
-        )
-        assert prefix_lse_bias.shape == (query.shape[1], num_tokens), (
-            "prefix_lse_bias must have shape [num_query_heads, num_tokens]"
-        )
-
     # Process shared prefix.
     prefix_output, prefix_lse = flash_attn_varlen_func(
-        q=prefix_query,
+        q=query,
         k=key_cache,
         v=value_cache,
         cu_seqlens_q=cu_prefix_query_lens,
@@ -1759,8 +1633,6 @@ def cascade_attention(
         s_aux=s_aux,
         num_splits=1 if envs.VLLM_BATCH_INVARIANT else max_num_splits,
     )
-    if prefix_lse_bias is not None:
-        prefix_lse.add_(prefix_lse_bias)
 
     descale_shape = (cu_query_lens.shape[0] - 1, key_cache.shape[-2])
 

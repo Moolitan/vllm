@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-import hashlib
-import json
 import math
-import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import Any
+
+from cskcache import profile_event
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
@@ -43,19 +42,11 @@ from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.core.segmentia_shared_kv import (
-    SharedSkillKVBank,
-    SharedSkillKVKey,
-    SharedSkillKVLease,
-    SharedSkillKVState,
-)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
     NewRequestData,
-    SegmentiaSharedKVBatchData,
-    SegmentiaSharedRequestData,
     ScheduledEncoderInputStats,
     SchedulerOutput,
 )
@@ -78,44 +69,16 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
-_SEGMENTIA_LOOKUP_EVENT_MARKER = "SEGMENTIA_EVENT"
-_SEGMENTIA_PROFILE_ENABLED = os.getenv("SEGMENTIA_PROFILE", "0") == "1"
-
-
-def _log_segmentia_lookup_event(
-    event: str, request_id: str, **fields: Any
-) -> None:
-    payload = {
-        "event": event,
-        "request_id": request_id,
-        "monotonic_ns": time.perf_counter_ns(),
-        **fields,
-    }
-    logger.info(
-        "%s %s",
-        _SEGMENTIA_LOOKUP_EVENT_MARKER,
-        json.dumps(payload, sort_keys=True, separators=(",", ":")),
-    )
-
 
 @dataclass
-class _SegmentiaLookupState:
-    segment_start: int
-    segment_end: int
-    cursor: int  # The stopping position P of the first local computation.
-    # initial → boundary_ready → lookup_complete/local_fallback
-    #                         └→ waiting_for_probe → ...
+class _CSKCacheReuseState:
+    """Scheduler-owned state for one authenticated CSKCache request."""
+
+    ticket: str
+    plan: dict[str, Any]
     phase: str = "initial"
-    ready_matched_end: int | None = None
-
-
-@dataclass(frozen=True)
-class _SegmentiaSharedBankPlan:
-    lease: SharedSkillKVLease
-    shared_start: int
-    shared_end: int
-    load_bank: bool
-    wait_for_ready: bool
+    readiness: dict[str, Any] | None = None
+    host_lease_owner: str = "scheduler"
 
 
 class Scheduler(SchedulerInterface):
@@ -235,6 +198,7 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        self._cskcache_reuses: dict[str, _CSKCacheReuseState] = {}
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -332,46 +296,6 @@ class Scheduler(SchedulerInterface):
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
-        self._segmentia_shared_kv_bank = (
-            SharedSkillKVBank(
-                self.kv_cache_manager.block_pool,
-                self.kv_cache_manager.num_kv_cache_groups,
-            )
-            if os.getenv("VLLM_SEGMENTIA_SHARED_KV", "0") == "1"
-            else None
-        )
-        pre_p_cap_value = os.getenv(
-            "VLLM_SEGMENTIA_SHARED_KV_PRE_P_CAP", "0"
-        )
-        try:
-            self._segmentia_shared_pre_p_cap = int(pre_p_cap_value)
-        except ValueError as exc:
-            raise ValueError(
-                "VLLM_SEGMENTIA_SHARED_KV_PRE_P_CAP must be an integer"
-            ) from exc
-        if self._segmentia_shared_pre_p_cap < 0:
-            raise ValueError(
-                "VLLM_SEGMENTIA_SHARED_KV_PRE_P_CAP must be non-negative"
-            )
-        if (
-            self._segmentia_shared_pre_p_cap > 0
-            and self._segmentia_shared_kv_bank is None
-        ):
-            raise ValueError(
-                "VLLM_SEGMENTIA_SHARED_KV_PRE_P_CAP requires "
-                "VLLM_SEGMENTIA_SHARED_KV=1"
-            )
-        # Admission lifetime is intentionally independent from a Bank lease.
-        # A Bank lease may be released when a request is deferred between
-        # Scheduler steps, while the request's private [0, P) KV remains live.
-        # Admission therefore lasts until request finish/abort.
-        self._segmentia_shared_pre_p_reservations: dict[
-            str, SharedSkillKVKey
-        ] = {}
-        self._segmentia_shared_pre_p_admitted_by_key: dict[
-            SharedSkillKVKey, set[str]
-        ] = {}
-        self._segmentia_shared_pre_p_wait_started_ns: dict[str, int] = {}
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -438,617 +362,6 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
-        # Phase-1 experimental state. Entries exist only for requests carrying
-        # an explicit lmcache_segmentia_lookup config.
-        self._segmentia_lookups: dict[str, _SegmentiaLookupState] = {}
-
-    def _register_segmentia_lookup(self, request: Request) -> None:
-        params = request.kv_transfer_params or {}
-        config = params.get("lmcache_segmentia_lookup")
-        if config is None:
-            return
-        if not isinstance(config, dict):
-            raise ValueError("lmcache_segmentia_lookup must be a mapping")
-        if not self.cache_config.enable_prefix_caching:
-            raise ValueError("lmcache_segmentia_lookup requires prefix caching")
-        if self.connector is None:
-            raise ValueError("lmcache_segmentia_lookup requires a KV connector")
-        required_apis = (
-            "poll_segmentia_probe",
-            "activate_segmentia_probe",
-            "rollback_segmentia_activation",
-            "cancel_segmentia_probe",
-        )
-        if any(not hasattr(self.connector, name) for name in required_apis):
-            raise ValueError(
-                "lmcache_segmentia_lookup requires a Segmentia-capable KV connector"
-            )
-        if self.scheduler_config.async_scheduling:
-            raise ValueError(
-                "lmcache_segmentia_lookup does not support async scheduling"
-            )
-        if self.has_mamba_layers:
-            raise ValueError(
-                "lmcache_segmentia_lookup supports full attention only"
-            )
-        if request.resumable:
-            raise ValueError("lmcache_segmentia_lookup does not support streaming")
-
-        segment_start = config.get("segment_start")
-        if isinstance(segment_start, bool) or not isinstance(segment_start, int):
-            raise ValueError("lmcache_segmentia_lookup.segment_start must be an int")
-        if not 0 < segment_start < request.num_prompt_tokens:
-            raise ValueError(
-                "lmcache_segmentia_lookup.segment_start must be inside the prompt"
-            )
-        segment_end = config.get("segment_end")
-        if isinstance(segment_end, bool) or not isinstance(segment_end, int):
-            raise ValueError(
-                "lmcache_segmentia_lookup.segment_end must be an int"
-            )
-        if not segment_start < segment_end <= request.num_prompt_tokens:
-            raise ValueError(
-                "lmcache_segmentia_lookup.segment_end must close the segment"
-            )
-
-        alignment = math.lcm(self.hash_block_size, self.block_size)
-        correction_mode = config.get("correction_mode", "none")
-        if correction_mode not in {"none", "prefix_k_headwise"}:
-            raise ValueError(
-                "lmcache_segmentia_lookup.correction_mode must be 'none' or "
-                "'prefix_k_headwise'"
-            )
-        if correction_mode == "prefix_k_headwise":
-            cache_end = config.get("cache_end")
-            if (
-                isinstance(cache_end, bool)
-                or not isinstance(cache_end, int)
-                or not segment_start < cache_end <= segment_end
-            ):
-                raise ValueError(
-                    "prefix_k_headwise requires cache_end inside the segment"
-                )
-            frozen_policy = {
-                "prefix_tokens": 256,
-                "calibration_start": 132,
-                "calibration_end": 256,
-                "minimum_reuse_tokens": 256,
-                "correction_alpha": 0.6,
-            }
-            for name, expected in frozen_policy.items():
-                value = config.get(name)
-                if isinstance(value, bool) or value != expected:
-                    raise ValueError(
-                        "prefix_k_headwise requires frozen policy "
-                        f"{name}={expected}, got {value!r}"
-                    )
-            nominal_cursor = segment_start + frozen_policy["prefix_tokens"]
-        else:
-            nominal_cursor = segment_start
-        cursor = (nominal_cursor + alignment - 1) // alignment * alignment
-        if cursor >= request.num_prompt_tokens:
-            raise ValueError(
-                "lmcache_segmentia_lookup has no cacheable boundary before prompt end"
-            )
-        if correction_mode == "prefix_k_headwise":
-            reusable_tokens = cache_end - cursor
-            config["nominal_lookup_cursor"] = nominal_cursor
-            config["lookup_cursor"] = cursor
-            config["aligned_prefix_tokens"] = cursor - segment_start
-            config["reusable_tokens"] = max(reusable_tokens, 0)
-            if reusable_tokens < config["minimum_reuse_tokens"]:
-                config["length_gate_fallback"] = True
-                params["lmcache_segmentia_decision"] = dict(config)
-                params.pop("lmcache_segmentia_lookup", None)
-                _log_segmentia_lookup_event(
-                    "segmentia_prefix_length_fallback",
-                    request.request_id,
-                    segment_start=segment_start,
-                    segment_end=segment_end,
-                    cache_end=cache_end,
-                    nominal_lookup_cursor=nominal_cursor,
-                    lookup_cursor=cursor,
-                    aligned_prefix_tokens=cursor - segment_start,
-                    reusable_tokens=max(reusable_tokens, 0),
-                    minimum_reuse_tokens=config["minimum_reuse_tokens"],
-                    phase="full_local",
-                )
-                return
-        self._segmentia_lookups[request.request_id] = _SegmentiaLookupState(
-            segment_start=segment_start,
-            segment_end=segment_end,
-            cursor=cursor,
-        )
-        config["lookup_cursor"] = cursor
-        _log_segmentia_lookup_event(
-            "segmentia_lookup_boundary",
-            request.request_id,
-            segment_start=segment_start,
-            lookup_cursor=cursor,
-            alignment=alignment,
-            prompt_tokens=request.num_prompt_tokens,
-            phase="initial",
-        )
-
-    def _limit_segmentia_lookup_chunk(
-        self, request: Request, num_computed_tokens: int, num_new_tokens: int
-    ) -> int:
-        """限制forward 只能计算到复用的起点位置前面
-        """
-        state = self._segmentia_lookups.get(request.request_id)
-        if state is None or state.phase != "initial":
-            return num_new_tokens
-        if num_computed_tokens >= state.cursor:
-            # native prefix caching (e.g. a concurrent duplicate request with
-            # identical prompt content) already advanced num_computed_tokens
-            # to or past cursor before this request's own scheduling caught
-            # up. The running->waiting requeue transition requires landing
-            # exactly on cursor (see the `== segmentia_state.cursor` check),
-            # which can no longer happen once we've overshot it -- clamping
-            # to max(cursor - num_computed_tokens, 0) here would zero out
-            # num_new_tokens and trip the scheduler's `assert num_new_tokens
-            # > 0` invariant. Stop capping instead and let this request
-            # proceed as an ordinary (non-segmentia-lookup) schedule.
-            #
-            # 这条分支在并发下会被真实触发（实测：并发 >= 2 时 100% 崩在
-            # scheduler.py 的 `assert num_new_tokens > 0`）。它是**静默降级**：
-            # 该请求这一轮不再走 segmentia 复用，退回普通调度。因此这里必须打日志，
-            # 否则测出来的"复用性能"里会混进一批其实没复用的请求。
-            state.phase = "overshot_fallback"
-            _log_segmentia_lookup_event(
-                "segmentia_lookup_overshot",
-                request_id=request.request_id,
-                cursor=state.cursor,
-                num_computed_tokens=num_computed_tokens,
-            )
-            return num_new_tokens
-        return min(num_new_tokens, state.cursor - num_computed_tokens)
-
-    def _wait_for_segmentia_probe(self, request: Request) -> None:
-        state = self._segmentia_lookups[request.request_id]
-        assert state.phase == "boundary_ready"
-        assert request.status == RequestStatus.RUNNING
-        assert request.num_computed_tokens == state.cursor
-        assert request.num_in_flight_tokens == 0
-
-        state.phase = "waiting_for_probe"
-        self._inflight_prefills.discard(request)
-        request.status = RequestStatus.WAITING_FOR_SEGMENT_LOOKUP
-        self.skipped_waiting.prepend_request(request)
-        _log_segmentia_lookup_event(
-            "segmentia_lookup_waiting",
-            request.request_id,
-            lookup_cursor=state.cursor,
-            num_computed_tokens=request.num_computed_tokens,
-            num_in_flight_tokens=request.num_in_flight_tokens,
-            retained_block_ownership=True,
-            phase=state.phase,
-        )
-
-    def _finish_segmentia_lookup(
-        self, request: Request, num_external_computed_tokens: int
-    ) -> None:
-        state = self._segmentia_lookups.get(request.request_id)
-        if state is None or state.phase not in (
-            "boundary_ready",
-            "waiting_for_probe",
-            "activated",
-        ):
-            return
-
-        config = (request.kv_transfer_params or {})["lmcache_segmentia_lookup"]
-        config["retained_local_tokens"] = state.cursor
-        config["external_hit_tokens"] = num_external_computed_tokens
-
-        state.phase = (
-            "lookup_complete"
-            if num_external_computed_tokens > 0
-            else "local_fallback"
-        )
-        _log_segmentia_lookup_event(
-            "segmentia_lookup_complete",
-            request.request_id,
-            lookup_cursor=state.cursor,
-            retained_local_tokens=state.cursor,
-            external_tokens=num_external_computed_tokens,
-            retained_block_ownership=True,
-            phase=state.phase,
-        )
-
-    def _release_segmentia_lookup_state(self, request_id: str) -> None:
-        state = self._segmentia_lookups.pop(request_id, None)
-        request = self.requests.get(request_id)
-        if state is not None and request is not None and self.connector is not None:
-            self.connector.cancel_segmentia_probe(request)
-        bank = self._segmentia_shared_kv_bank
-        if bank is not None:
-            entry = bank.get_for_request(request_id)
-            if entry is not None:
-                was_pre_p_reservation = (
-                    request_id in self._segmentia_shared_pre_p_reservations
-                )
-                key = entry.key
-                block_ids = entry.block_ids[0]
-                bank.release(request_id)
-                resident = bank.get(key)
-                _log_segmentia_lookup_event(
-                    "segmentia_shared_bank_release",
-                    request_id,
-                    bank_state=(
-                        resident.state.value if resident is not None else "evicted"
-                    ),
-                    bank_token_hash=key.token_hash,
-                    shared_block_ids=block_ids,
-                    lease_count=(resident.lease_count if resident is not None else 0),
-                    pre_p_reservation=was_pre_p_reservation,
-                )
-        self._release_segmentia_shared_pre_p_admission(request_id)
-        self._segmentia_shared_pre_p_wait_started_ns.pop(request_id, None)
-
-    def _release_segmentia_shared_pre_p_admission(
-        self, request_id: str
-    ) -> None:
-        key = self._segmentia_shared_pre_p_reservations.pop(request_id, None)
-        if key is None:
-            return
-        admitted = self._segmentia_shared_pre_p_admitted_by_key.get(key)
-        if admitted is None or request_id not in admitted:
-            raise RuntimeError("shared Skill pre-P admission state is inconsistent")
-        admitted.remove(request_id)
-        admission_count = len(admitted)
-        if not admitted:
-            del self._segmentia_shared_pre_p_admitted_by_key[key]
-        _log_segmentia_lookup_event(
-            "segmentia_shared_pre_p_release",
-            request_id,
-            bank_token_hash=key.token_hash,
-            cap=self._segmentia_shared_pre_p_cap,
-            admission_count=admission_count,
-        )
-
-    def _build_segmentia_shared_key(
-        self,
-        request: Request,
-        shared_start: int,
-        shared_end: int,
-    ) -> SharedSkillKVKey:
-        token_bytes = b"".join(
-            int(token_id).to_bytes(4, "little", signed=False)
-            for token_id in request.all_token_ids[shared_start:shared_end]
-        )
-        model_config = self.vllm_config.model_config
-        model_name = str(model_config.model)
-        model_revision = str(getattr(model_config, "revision", None) or "")
-        return SharedSkillKVKey(
-            model_fingerprint=f"{model_name}@{model_revision}",
-            kv_dtype=str(model_config.dtype),
-            kv_layout="vllm-paged-kv-v1",
-            block_size=self.block_size,
-            tp_world_size=self.parallel_config.tensor_parallel_size,
-            token_hash=hashlib.sha256(token_bytes).hexdigest(),
-            num_tokens=shared_end - shared_start,
-            correction_version="prefix-k-headwise-alpha0.6-v1",
-        )
-
-    def _expected_segmentia_shared_key(
-        self, request: Request
-    ) -> tuple[SharedSkillKVKey, int, int] | None:
-        state = self._segmentia_lookups.get(request.request_id)
-        config = (request.kv_transfer_params or {}).get(
-            "lmcache_segmentia_lookup"
-        )
-        if state is None or not isinstance(config, dict):
-            return None
-        if config.get("correction_mode") != "prefix_k_headwise":
-            return None
-        shared_start = state.cursor
-        shared_end = (
-            min(int(config["cache_end"]), state.segment_end)
-            // self.block_size
-            * self.block_size
-        )
-        if shared_end - shared_start < int(config["minimum_reuse_tokens"]):
-            return None
-        return (
-            self._build_segmentia_shared_key(
-                request, shared_start, shared_end
-            ),
-            shared_start,
-            shared_end,
-        )
-
-    def _try_reserve_segmentia_shared_pre_p(self, request: Request) -> bool:
-        """Reserve one READY-Bank admission before allocating private KV."""
-        cap = self._segmentia_shared_pre_p_cap
-        bank = self._segmentia_shared_kv_bank
-        state = self._segmentia_lookups.get(request.request_id)
-        if (
-            cap == 0
-            or bank is None
-            or state is None
-            or state.phase != "initial"
-            or request.num_computed_tokens != 0
-        ):
-            return True
-        reserved_key = self._segmentia_shared_pre_p_reservations.get(
-            request.request_id
-        )
-        if reserved_key is not None:
-            return True
-
-        expected = self._expected_segmentia_shared_key(request)
-        if expected is None:
-            return True
-        key, shared_start, shared_end = expected
-        entry = bank.get(key)
-        # The diagnostic admission applies only to an exact resident READY
-        # object. Misses, partial hits, and load owners keep their old path.
-        if entry is None or entry.state != SharedSkillKVState.READY:
-            return True
-        admitted = self._segmentia_shared_pre_p_admitted_by_key.get(key)
-        admission_count = len(admitted) if admitted is not None else 0
-        if admission_count >= cap:
-            if (
-                request.request_id
-                not in self._segmentia_shared_pre_p_wait_started_ns
-            ):
-                self._segmentia_shared_pre_p_wait_started_ns[request.request_id] = (
-                    time.perf_counter_ns()
-                )
-                _log_segmentia_lookup_event(
-                    "segmentia_shared_pre_p_wait",
-                    request.request_id,
-                    bank_token_hash=key.token_hash,
-                    cap=cap,
-                    reservation_count=admission_count,
-                    private_tokens=state.cursor,
-                    private_blocks=math.ceil(state.cursor / self.block_size),
-                    shared_start=shared_start,
-                    shared_end=shared_end,
-                )
-            return False
-
-        if admitted is None:
-            admitted = set()
-            self._segmentia_shared_pre_p_admitted_by_key[key] = admitted
-        admitted.add(request.request_id)
-        self._segmentia_shared_pre_p_reservations[request.request_id] = key
-        admission_count = len(admitted)
-        wait_started_ns = self._segmentia_shared_pre_p_wait_started_ns.pop(
-            request.request_id, None
-        )
-        _log_segmentia_lookup_event(
-            "segmentia_shared_pre_p_admit",
-            request.request_id,
-            bank_token_hash=key.token_hash,
-            cap=cap,
-            reservation_count=admission_count,
-            private_tokens=state.cursor,
-            private_blocks=math.ceil(state.cursor / self.block_size),
-            shared_start=shared_start,
-            shared_end=shared_end,
-            shared_blocks=key.num_tokens // key.block_size,
-            wait_ms=(
-                (time.perf_counter_ns() - wait_started_ns) / 1_000_000
-                if wait_started_ns is not None
-                else 0.0
-            ),
-        )
-        return True
-
-    def _prepare_segmentia_shared_bank_plan(
-        self, request: Request, matched_end: int
-    ) -> _SegmentiaSharedBankPlan | None:
-        """Acquire the aligned shared B1 body without mutating request blocks."""
-        bank = self._segmentia_shared_kv_bank
-        state = self._segmentia_lookups.get(request.request_id)
-        config = (request.kv_transfer_params or {}).get(
-            "lmcache_segmentia_lookup"
-        )
-        if bank is None or state is None or not isinstance(config, dict):
-            return None
-        if self.parallel_config.tensor_parallel_size != 1:
-            return None
-        if config.get("correction_mode") != "prefix_k_headwise":
-            return None
-
-        shared_start = state.cursor
-        cache_end = int(config["cache_end"])
-        upper_bound = min(matched_end, cache_end, state.segment_end)
-        shared_end = upper_bound // self.block_size * self.block_size
-        minimum_reuse_tokens = int(config["minimum_reuse_tokens"])
-        if shared_end - shared_start < minimum_reuse_tokens:
-            return None
-
-        key = self._build_segmentia_shared_key(
-            request, shared_start, shared_end
-        )
-        reserved_key = self._segmentia_shared_pre_p_reservations.get(
-            request.request_id
-        )
-        if reserved_key is not None and reserved_key != key:
-            # The early reservation was for an exact READY object, but the
-            # formal LMCache result no longer covers that same range. Keep the
-            # reservation until request completion so the private live-set cap
-            # remains valid, and use the ordinary materialized/fallback path.
-            return None
-        lease = bank.acquire(
-            key,
-            request.request_id,
-            num_blocks_per_group=key.num_tokens // key.block_size,
-        )
-        if lease is None:
-            return None
-        entry = bank.get(key)
-        assert entry is not None
-        if lease.is_load_owner and entry.state == SharedSkillKVState.ALLOCATING:
-            bank.mark_loading(lease)
-            entry = bank.get(key)
-            assert entry is not None
-        return _SegmentiaSharedBankPlan(
-            lease=lease,
-            shared_start=shared_start,
-            shared_end=shared_end,
-            load_bank=(
-                entry.state == SharedSkillKVState.LOADING
-                and lease.is_load_owner
-            ),
-            wait_for_ready=(
-                entry.state == SharedSkillKVState.LOADING
-                and not lease.is_load_owner
-            ),
-        )
-
-    def _install_segmentia_shared_bank_plan(
-        self, plan: _SegmentiaSharedBankPlan
-    ) -> None:
-        """Atomically install a request's virtual range and Bank binding."""
-        bank = self._segmentia_shared_kv_bank
-        if bank is None:
-            raise RuntimeError("shared Skill KV Bank is disabled")
-        appended = False
-        try:
-            self.kv_cache_manager.append_shared_null_range(
-                plan.lease.request_id,
-                plan.shared_start,
-                plan.shared_end,
-            )
-            appended = True
-            bank.bind_request_range(
-                plan.lease,
-                plan.shared_start,
-                plan.shared_end,
-            )
-        except Exception:
-            if appended:
-                self.kv_cache_manager.pop_shared_null_range(
-                    plan.lease.request_id,
-                    plan.shared_start,
-                    plan.shared_end,
-                )
-            bank.release(plan.lease.request_id)
-            raise
-
-    def _rollback_segmentia_shared_bank_plan(
-        self, plan: _SegmentiaSharedBankPlan
-    ) -> None:
-        """Remove an installed virtual range before private tail allocation."""
-        bank = self._segmentia_shared_kv_bank
-        if bank is None:
-            raise RuntimeError("shared Skill KV Bank is disabled")
-        binding = bank.get_request_binding(plan.lease.request_id)
-        if binding is not None:
-            if (
-                binding.shared_start != plan.shared_start
-                or binding.shared_end != plan.shared_end
-                or binding.key != plan.lease.key
-            ):
-                raise RuntimeError("shared Skill rollback plan does not match binding")
-            self.kv_cache_manager.pop_shared_null_range(
-                plan.lease.request_id,
-                plan.shared_start,
-                plan.shared_end,
-            )
-        bank.release(plan.lease.request_id)
-
-    def _build_segmentia_shared_kv_batch(
-        self, scheduled_request_ids: Iterable[str]
-    ) -> SegmentiaSharedKVBatchData | None:
-        bank = self._segmentia_shared_kv_bank
-        if bank is None:
-            return None
-        request_ids = tuple(scheduled_request_ids)
-        bindings = tuple(bank.get_request_binding(req_id) for req_id in request_ids)
-        num_bound = sum(binding is not None for binding in bindings)
-        if num_bound == 0:
-            return None
-        if num_bound != len(request_ids):
-            raise RuntimeError(
-                "shared Skill metadata must cover the whole scheduled batch"
-            )
-
-        first = bindings[0]
-        assert first is not None
-        if any(binding is None or binding.key != first.key for binding in bindings):
-            raise RuntimeError("scheduled shared requests must use one Bank key")
-        entry = bank.get(first.key)
-        if entry is None:
-            raise RuntimeError("scheduled shared Skill Bank is missing")
-        if entry.state == SharedSkillKVState.LOADING:
-            if request_ids != (entry.load_owner_request_id,):
-                raise RuntimeError(
-                    "loading shared Skill Bank may schedule only its load owner"
-                )
-        elif entry.state != SharedSkillKVState.READY:
-            raise RuntimeError("scheduled shared Skill Bank is not usable")
-        if len(entry.block_ids) != 1:
-            raise RuntimeError("shared Skill attention requires one KV cache group")
-
-        key = first.key
-        serialized_key = "|".join(
-            (
-                key.model_fingerprint,
-                key.kv_dtype,
-                key.kv_layout,
-                str(key.block_size),
-                str(key.tp_world_size),
-                key.token_hash,
-                str(key.num_tokens),
-                key.correction_version,
-            )
-        )
-        return SegmentiaSharedKVBatchData(
-            bank_key=serialized_key,
-            shared_block_ids=entry.block_ids[0],
-            shared_token_count=key.num_tokens,
-            requests=tuple(
-                SegmentiaSharedRequestData(
-                    req_id=req_id,
-                    shared_start=binding.shared_start,
-                    shared_end=binding.shared_end,
-                )
-                for req_id, binding in zip(request_ids, bindings, strict=True)
-                if binding is not None
-            ),
-            bank_state=entry.state.value,
-            load_owner_request_id=(
-                entry.load_owner_request_id
-                if entry.state == SharedSkillKVState.LOADING
-                else None
-            ),
-        )
-
-    def _apply_segmentia_shared_load_results(
-        self, kv_connector_output: KVConnectorOutput
-    ) -> None:
-        bank = self._segmentia_shared_kv_bank
-        results = kv_connector_output.segmentia_shared_loads
-        if bank is None:
-            if results:
-                raise RuntimeError(
-                    "received shared Skill load results while Bank is disabled"
-                )
-            return
-        for result in results:
-            entry = bank.complete_load(
-                result.request_id,
-                success=result.success,
-                failure_reason=result.failure_reason,
-            )
-            _log_segmentia_lookup_event(
-                "segmentia_shared_bank_publish",
-                result.request_id,
-                success=result.success,
-                bank_state=entry.state.value,
-                bank_token_hash=entry.key.token_hash,
-                shared_tokens=entry.key.num_tokens,
-                shared_block_ids=entry.block_ids[0],
-                failure_reason=result.failure_reason,
-            )
-            if not result.success:
-                affected_request_ids = tuple(entry.request_ids)
-                for request_id in affected_request_ids:
-                    self._release_segmentia_lookup_state(request_id)
 
     def _mamba_block_aligned_split(
         self,
@@ -1120,6 +433,107 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
+    def _register_cskcache_reuse(self, request: Request) -> None:
+        verified = (request.kv_transfer_params or {}).get("cskcache_verified")
+        if not isinstance(verified, dict) or self.connector is None:
+            return
+        ticket = verified.get("ticket")
+        if not isinstance(ticket, str) or verified.get("request_id") != request.request_id:
+            return
+        if self.scheduler_config.async_scheduling:
+            self.connector.cancel_csk_prefetch(ticket, "unsupported_scheduler_mode")
+            return
+        alignment = math.lcm(self.hash_block_size, self.block_size)
+        plan = self.connector.prepare_csk_reuse(
+            ticket, request.request_id, alignment
+        )
+        integer_fields = (
+            "segment_start",
+            "segment_end",
+            "reuse_start",
+            "reuse_end",
+            "source_reuse_start",
+            "source_reuse_end",
+            "calibration_start",
+            "calibration_end",
+            "block_alignment",
+        )
+        valid = isinstance(plan, dict) and all(
+            isinstance(plan.get(name), int)
+            and not isinstance(plan.get(name), bool)
+            for name in integer_fields
+        )
+        if valid:
+            assert isinstance(plan, dict)
+            valid = (
+                plan.get("ticket") == ticket
+                and plan.get("request_id") == request.request_id
+                and plan.get("cache_object_id") == verified.get("cache_object_id")
+                and plan["segment_start"] == verified.get("segment_start")
+                and plan["segment_end"] == verified.get("segment_end")
+                and 0 < plan["segment_start"]
+                <= plan["calibration_start"]
+                < plan["calibration_end"]
+                <= plan["reuse_start"]
+                < plan["reuse_end"]
+                <= plan["segment_end"]
+                <= request.num_prompt_tokens
+                and plan["reuse_start"] % alignment == 0
+                and plan["reuse_end"] % alignment == 0
+                and plan["block_alignment"] == alignment
+                and isinstance(plan.get("correction_alpha"), (int, float))
+                and not isinstance(plan.get("correction_alpha"), bool)
+                and float(plan["correction_alpha"]) == 0.6
+                and plan["reuse_end"] - plan["reuse_start"]
+                == plan["source_reuse_end"] - plan["source_reuse_start"]
+            )
+        if not valid:
+            self.connector.cancel_csk_prefetch(ticket, "invalid_reuse_plan")
+            return
+        assert isinstance(plan, dict)
+        self._cskcache_reuses[request.request_id] = _CSKCacheReuseState(
+            ticket=ticket, plan=dict(plan)
+        )
+        profile_event(
+            "csk_reuse_registered",
+            request.request_id,
+            ticket=ticket,
+            reuse_start=plan["reuse_start"],
+            reuse_end=plan["reuse_end"],
+        )
+
+    def _limit_cskcache_chunk(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> int:
+        state = self._cskcache_reuses.get(request.request_id)
+        if state is None or state.phase != "initial":
+            return num_new_tokens
+        reuse_start = int(state.plan["reuse_start"])
+        if num_computed_tokens >= reuse_start:
+            state.phase = "fallback"
+            self._release_cskcache_lease(state)
+            return num_new_tokens
+        return min(num_new_tokens, reuse_start - num_computed_tokens)
+
+    def _release_cskcache_lease(self, state: _CSKCacheReuseState) -> bool:
+        if state.host_lease_owner != "scheduler" or self.connector is None:
+            return False
+        released = self.connector.release_csk_reuse(state.ticket)
+        if released:
+            state.host_lease_owner = "released"
+        return released
+
+    @staticmethod
+    def _handoff_cskcache_lease(state: _CSKCacheReuseState) -> None:
+        if state.host_lease_owner != "scheduler":
+            raise RuntimeError("CSKCache lease is not owned by the scheduler")
+        state.host_lease_owner = "worker"
+
+    def _release_cskcache_state(self, request_id: str) -> None:
+        state = self._cskcache_reuses.pop(request_id, None)
+        if state is not None:
+            self._release_cskcache_lease(state)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -1137,8 +551,6 @@ class Scheduler(SchedulerInterface):
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
         preempted_reqs: list[Request] = []
-        segmentia_deferred_this_step: set[str] = set()
-        segmentia_shared_batch_key: SharedSkillKVKey | None = None
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
@@ -1170,64 +582,6 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
-            bank = self._segmentia_shared_kv_bank
-            binding = (
-                bank.get_request_binding(request.request_id)
-                if bank is not None
-                else None
-            )
-            request_shared_key = binding.key if binding is not None else None
-            if request_shared_key is None:
-                if segmentia_shared_batch_key is not None:
-                    req_index += 1
-                    continue
-            elif num_scheduled_tokens and (
-                segmentia_shared_batch_key is None
-                or segmentia_shared_batch_key != request_shared_key
-            ):
-                req_index += 1
-                continue
-            num_external_computed_tokens = 0
-            segmentia_state = self._segmentia_lookups.get(request.request_id)
-            if (
-                segmentia_state is not None
-                and segmentia_state.phase == "boundary_ready"
-            ):
-                matched_end = self.connector.poll_segmentia_probe(request)
-                if matched_end is None:
-                    self.running.pop(req_index)
-                    self._wait_for_segmentia_probe(request)
-                    segmentia_deferred_this_step.add(request.request_id)
-                    continue
-                if matched_end <= segmentia_state.cursor:
-                    self.connector.cancel_segmentia_probe(request)
-                    self._finish_segmentia_lookup(request, 0)
-                elif (
-                    self._segmentia_shared_kv_bank is not None
-                    and self.parallel_config.tensor_parallel_size == 1
-                    and (request.kv_transfer_params or {})[
-                        "lmcache_segmentia_lookup"
-                    ].get("correction_mode")
-                    == "prefix_k_headwise"
-                ):
-                    # A shared load owner must execute in an isolated batch.
-                    # Move it through the ownership-preserving Segmentia pause
-                    # even when the asynchronous probe is already ready.
-                    segmentia_state.ready_matched_end = matched_end
-                    self.running.pop(req_index)
-                    self._wait_for_segmentia_probe(request)
-                    segmentia_deferred_this_step.add(request.request_id)
-                    continue
-                else:
-                    num_external_computed_tokens = (
-                        self.connector.activate_segmentia_probe(
-                            request, request.num_computed_tokens
-                        )
-                    )
-                    if num_external_computed_tokens > 0:
-                        segmentia_state.phase = "activated"
-                    else:
-                        self._finish_segmentia_lookup(request, 0)
 
             if (
                 request.num_output_placeholders > 0
@@ -1261,7 +615,6 @@ class Scheduler(SchedulerInterface):
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
                 - request.num_computed_tokens
-                - num_external_computed_tokens
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
@@ -1273,10 +626,9 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens,
                 self.max_model_len
                 - request.num_computed_tokens
-                - num_external_computed_tokens
                 - self.num_sampled_tokens_per_step,
             )
-            num_new_tokens = self._limit_segmentia_lookup_chunk(
+            num_new_tokens = self._limit_cskcache_chunk(
                 request, request.num_computed_tokens, num_new_tokens
             )
 
@@ -1328,9 +680,6 @@ class Scheduler(SchedulerInterface):
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
-                        num_external_computed_tokens=(
-                            num_external_computed_tokens
-                        ),
                     )
 
                     if new_blocks is not None:
@@ -1349,8 +698,6 @@ class Scheduler(SchedulerInterface):
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
-                            if not num_scheduled_tokens:
-                                segmentia_shared_batch_key = None
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -1376,24 +723,7 @@ class Scheduler(SchedulerInterface):
 
             if new_blocks is None:
                 # Cannot schedule this request.
-                if (
-                    num_external_computed_tokens > 0
-                    and request.request_id in self._segmentia_lookups
-                ):
-                    self.connector.rollback_segmentia_activation(request)
-                    self._finish_segmentia_lookup(request, 0)
                 break
-
-            if num_external_computed_tokens > 0:
-                self.connector.update_state_after_alloc(
-                    request,
-                    self.kv_cache_manager.get_blocks(request.request_id),
-                    num_external_computed_tokens,
-                )
-                request.num_computed_tokens += num_external_computed_tokens
-                self._finish_segmentia_lookup(
-                    request, num_external_computed_tokens
-                )
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
@@ -1402,13 +732,6 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
-            if request_shared_key is not None:
-                if segmentia_shared_batch_key is None:
-                    segmentia_shared_batch_key = request_shared_key
-                elif segmentia_shared_batch_key != request_shared_key:
-                    raise RuntimeError(
-                        "scheduled RUNNING shared requests use different Bank keys"
-                    )
             req_index += 1
 
             # Speculative decode related.
@@ -1459,88 +782,23 @@ class Scheduler(SchedulerInterface):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                request_queue = self._select_waiting_queue_for_scheduling()
-                assert request_queue is not None
-                request = request_queue.peek_request()
-
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
-                num_waiting_for_segment_lookup = sum(
-                    req.status == RequestStatus.WAITING_FOR_SEGMENT_LOOKUP
-                    for req in self.requests.values()
-                )
-                num_running = (
-                    len(self.running)
-                    + self.num_waiting_for_streaming_input
-                    + num_waiting_for_segment_lookup
-                )
+                num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_running_reqs:
-                    if (
-                        request.status
-                        != RequestStatus.WAITING_FOR_SEGMENT_LOOKUP
-                    ):
-                        # A blocked Segmentia request already owns a model
-                        # runner/KV slot. Resume it ahead of ordinary waiting
-                        # requests so priority ordering cannot strand it at
-                        # the max-sequence limit.
-                        segment_waiting = next(
-                            (
-                                req
-                                for req in self.skipped_waiting
-                                if req.status
-                                == RequestStatus.WAITING_FOR_SEGMENT_LOOKUP
-                            ),
-                            None,
-                        )
-                        if segment_waiting is None:
-                            break
-                        self.skipped_waiting.remove_requests([segment_waiting])
-                        self.skipped_waiting.prepend_request(segment_waiting)
-                        request_queue = self.skipped_waiting
-                        request = segment_waiting
+                    break
 
+                request_queue = self._select_waiting_queue_for_scheduling()
+                assert request_queue is not None
+
+                request = request_queue.peek_request()
                 request_id = request.request_id
-
-                if request_id in segmentia_deferred_this_step:
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
-                    continue
-
-                segmentia_state = self._segmentia_lookups.get(request_id)
-                is_segmentia_reentry = (
-                    segmentia_state is not None
-                    and segmentia_state.phase == "waiting_for_probe"
+                cskcache_state = self._cskcache_reuses.get(request_id)
+                is_cskcache_reentry = (
+                    cskcache_state is not None
+                    and cskcache_state.phase == "waiting"
+                    and request.status == RequestStatus.WAITING_FOR_CSKCACHE
                 )
-                bank = self._segmentia_shared_kv_bank
-                binding = (
-                    bank.get_request_binding(request_id)
-                    if bank is not None
-                    else None
-                )
-                request_shared_key = binding.key if binding is not None else None
-                if segmentia_shared_batch_key is not None:
-                    can_attempt_shared_reentry = is_segmentia_reentry
-                    already_joins_shared_batch = (
-                        request_shared_key == segmentia_shared_batch_key
-                    )
-                    if not (
-                        can_attempt_shared_reentry or already_joins_shared_batch
-                    ):
-                        request_queue.pop_request()
-                        step_skipped_waiting.prepend_request(request)
-                        continue
-                elif num_scheduled_tokens and request_shared_key is not None:
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
-                    continue
-
-                if not self._try_reserve_segmentia_shared_pre_p(request):
-                    # Do not compute or allocate [0, P) until this READY Bank
-                    # has an admission slot. Keep the request in initial
-                    # Waiting so a later release can admit it cleanly.
-                    request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
-                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -1573,145 +831,52 @@ class Scheduler(SchedulerInterface):
                 num_external_computed_tokens = 0
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
-                segmentia_shared_plan: _SegmentiaSharedBankPlan | None = None
 
-                if is_segmentia_reentry:
-                    # Segmentia connector lookup after an ownership-preserving pause.
-                    assert segmentia_state is not None
+                # CSKCache resumes exactly at its authenticated reuse boundary.
+                if is_cskcache_reentry:
+                    assert cskcache_state is not None
                     assert (
-                        request.status
-                        == RequestStatus.WAITING_FOR_SEGMENT_LOOKUP
+                        request.num_computed_tokens
+                        == cskcache_state.plan["reuse_start"]
                     )
-                    assert request.num_computed_tokens == segmentia_state.cursor
-                    assert request.num_in_flight_tokens == 0
-
-                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                    new_computed_blocks = (
+                        self.kv_cache_manager.empty_kv_cache_blocks
+                    )
                     num_new_local_computed_tokens = 0
-
-                    connector_lookup_start = request.num_computed_tokens
-                    matched_end = segmentia_state.ready_matched_end
-                    assert matched_end is not None
-                    segmentia_state.ready_matched_end = None
-                    if matched_end <= segmentia_state.cursor:
-                        self.connector.cancel_segmentia_probe(request)
-                        ext_tokens = 0
+                    readiness = cskcache_state.readiness or {}
+                    cskcache_state.readiness = None
+                    activated = None
+                    if (
+                        readiness.get("status") == "ready"
+                        and readiness.get("plan") == cskcache_state.plan
+                    ):
+                        activated = self.connector.activate_csk_reuse(
+                            cskcache_state.ticket, request_id
+                        )
+                    if activated == cskcache_state.plan:
+                        num_external_computed_tokens = (
+                            cskcache_state.plan["reuse_end"]
+                            - cskcache_state.plan["reuse_start"]
+                        )
+                        cskcache_state.phase = "activated"
+                        profile_event(
+                            "csk_reuse_scheduler_activate",
+                            request_id,
+                            ticket=cskcache_state.ticket,
+                            external_tokens=num_external_computed_tokens,
+                        )
                     else:
-                        candidate_plan = self._prepare_segmentia_shared_bank_plan(
-                            request,
-                            matched_end,
-                        )
-                        bank = self._segmentia_shared_kv_bank
-                        if candidate_plan is not None and candidate_plan.wait_for_ready:
-                            assert bank is not None
-                            entry = bank.get(candidate_plan.lease.key)
-                            assert entry is not None
-                            _log_segmentia_lookup_event(
-                                "segmentia_shared_bank_wait",
-                                request.request_id,
-                                bank_state=entry.state.value,
-                                bank_token_hash=entry.key.token_hash,
-                                shared_start=candidate_plan.shared_start,
-                                shared_end=candidate_plan.shared_end,
-                                shared_block_ids=entry.block_ids[0],
-                            )
-                            # The Bank owner has not published READY yet. Keep the
-                            # already completed probe result and retry this same
-                            # ownership-preserving reentry after its completion
-                            # acknowledgement, without pinning LMCache or falling
-                            # back to local recomputation.
-                            bank.release(request.request_id)
-                            segmentia_state.ready_matched_end = matched_end
-                            request_queue.pop_request()
-                            step_skipped_waiting.prepend_request(request)
-                            continue
-                        if candidate_plan is not None and num_scheduled_tokens:
-                            assert bank is not None
-                            joins_ready_shared_batch = (
-                                segmentia_shared_batch_key is not None
-                                and not candidate_plan.load_bank
-                                and candidate_plan.lease.key
-                                == segmentia_shared_batch_key
-                            )
-                            if not joins_ready_shared_batch:
-                                bank.release(request.request_id)
-                                request_queue.pop_request()
-                                step_skipped_waiting.prepend_request(request)
-                                continue
-
-                        if candidate_plan is None:
-                            ext_tokens = self.connector.activate_segmentia_probe(
-                                request, connector_lookup_start
-                            )
-                        else:
-                            self._install_segmentia_shared_bank_plan(candidate_plan)
-                            config = (request.kv_transfer_params or {})[
-                                "lmcache_segmentia_lookup"
-                            ]
-                            config["shared_load_end"] = candidate_plan.shared_end
-                            config["shared_bank_correction_only"] = (
-                                not candidate_plan.load_bank
-                            )
-                            ext_tokens = self.connector.activate_segmentia_probe(
-                                request, connector_lookup_start
-                            )
-                            expected_tokens = (
-                                candidate_plan.shared_end
-                                - candidate_plan.shared_start
-                            )
-                            if ext_tokens != expected_tokens:
-                                self.connector.rollback_segmentia_activation(request)
-                                self._rollback_segmentia_shared_bank_plan(
-                                    candidate_plan
-                                )
-                                config.pop("shared_load_end", None)
-                                config.pop("shared_bank_correction_only", None)
-                                ext_tokens = 0
-                            else:
-                                segmentia_shared_plan = candidate_plan
-                                entry = bank.get(candidate_plan.lease.key)
-                                assert entry is not None
-                                _log_segmentia_lookup_event(
-                                    "segmentia_shared_bank_activate",
-                                    request.request_id,
-                                    activation_mode=(
-                                        "owner_load"
-                                        if candidate_plan.load_bank
-                                        else "follower_correction_only"
-                                    ),
-                                    bank_state=entry.state.value,
-                                    bank_token_hash=entry.key.token_hash,
-                                    shared_start=candidate_plan.shared_start,
-                                    shared_end=candidate_plan.shared_end,
-                                    shared_block_ids=entry.block_ids[0],
-                                    lease_count=entry.lease_count,
-                                )
-
-                    if _SEGMENTIA_PROFILE_ENABLED:
-                        _log_segmentia_lookup_event(
-                            "segmentia_profile_connector_lookup",
-                            request.request_id,
-                            external_tokens=ext_tokens,
-                            phase=segmentia_state.phase,
-                        )
-
-                    num_external_computed_tokens = ext_tokens
-                    assert num_external_computed_tokens >= 0
-
-                    # 总计算进度必须包括此前已经保留的 P
+                        num_external_computed_tokens = 0
+                        cskcache_state.phase = "fallback"
+                        self._release_cskcache_lease(cskcache_state)
                     num_computed_tokens = (
                         request.num_computed_tokens
                         + num_external_computed_tokens
                     )
-                    assert num_computed_tokens <= request.num_tokens
 
-                    connector_prefix_cache_queries = (
-                        request.num_tokens - connector_lookup_start
-                    )
-
-                    connector_prefix_cache_hits = num_external_computed_tokens
-
+                # Get already-cached tokens.
                 elif request.num_computed_tokens == 0:
-                    # Ordinary new request or ordinary preempted request.
+                    # Get locally-cached tokens.
                     if (
                         self.connector is not None
                         and self.has_mamba_layers
@@ -1761,20 +926,11 @@ class Scheduler(SchedulerInterface):
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
-                        if (
-                            segmentia_state is not None
-                            and segmentia_state.phase == "initial"
-                        ):
-                            # The admission-time Segmentia probe is the only
-                            # external query before P. Ordinary prefix lookup
-                            # here would duplicate work and may pin too early.
-                            ext_tokens = 0
-                        else:
-                            ext_tokens, load_kv_async = (
-                                self.connector.get_num_new_matched_tokens(
-                                    request, num_new_local_computed_tokens
-                                )
+                        ext_tokens, load_kv_async = (
+                            self.connector.get_num_new_matched_tokens(
+                                request, num_new_local_computed_tokens
                             )
+                        )
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
@@ -1820,10 +976,8 @@ class Scheduler(SchedulerInterface):
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
-                    # 这个请求之前已经查过 KV，并且已经知道有多少 KV 可以复用。
-                    # 典型情况就是查完之后，异步等待传输的完成
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
-                    num_new_local_computed_tokens = 0  # 本地前缀命中为 0，是外部的
+                    num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
                 encoder_inputs_to_schedule = None
@@ -1879,8 +1033,7 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
-                    # 这里是第一次进入 waiting 队列时，防止进入 running 时，一次把复用以及复用后面的位置也调度进去
-                    num_new_tokens = self._limit_segmentia_lookup_chunk(
+                    num_new_tokens = self._limit_cskcache_chunk(
                         request, num_computed_tokens, num_new_tokens
                     )
                     assert num_new_tokens > 0
@@ -1942,7 +1095,6 @@ class Scheduler(SchedulerInterface):
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
 
-                allocation_started = time.perf_counter_ns()
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -1956,87 +1108,17 @@ class Scheduler(SchedulerInterface):
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
                 )
-                if (
-                    _SEGMENTIA_PROFILE_ENABLED
-                    and request.request_id in self._segmentia_lookups
-                    and self._segmentia_lookups[request.request_id].phase
-                    == "waiting_for_probe"
-                ):
-                    _log_segmentia_lookup_event(
-                        "segmentia_profile_allocate_slots",
-                        request.request_id,
-                        duration_ms=(time.perf_counter_ns() - allocation_started)
-                        / 1_000_000,
-                        external_tokens=num_external_computed_tokens,
-                        allocated=new_blocks is not None,
-                        phase="waiting_for_probe",
-                    )
-
-                if (
-                    new_blocks is None
-                    and is_segmentia_reentry
-                    and num_external_computed_tokens > 0
-                ):
-                    # 请求仍然拥有 [0, P)，因此外部分配失败可以回退到从 P 进行本地计算，而不会丢弃已计算的键值。
-                    # 下面的成功本地分配会调用 update_state_after_alloc(..., 0)，该函数会清除连接器缓存的查找状态。
-
-                    # 如果 LMCache 找到了复用的token，但是没有足够的 slots 接收 external KV
-                    self.connector.rollback_segmentia_activation(request)
-                    if segmentia_shared_plan is not None:
-                        self._rollback_segmentia_shared_bank_plan(
-                            segmentia_shared_plan
-                        )
-                        config = (request.kv_transfer_params or {})[
-                            "lmcache_segmentia_lookup"
-                        ]
-                        config.pop("shared_load_end", None)
-                        config.pop("shared_bank_correction_only", None)
-                        segmentia_shared_plan = None
-                    self._finish_segmentia_lookup(request, 0)
-                    num_external_computed_tokens = 0
-                    load_kv_async = False
-                    num_computed_tokens = request.num_computed_tokens
-                    num_new_tokens = request.num_tokens - num_computed_tokens
-                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
-                        num_new_tokens = threshold
-                    if (
-                        not self.scheduler_config.enable_chunked_prefill
-                        and num_new_tokens > token_budget
-                    ):
-                        break
-                    num_new_tokens = min(num_new_tokens, token_budget)
-                    assert num_new_tokens > 0
-
-                    effective_lookahead_tokens = self.num_lookahead_tokens
-                    # 从 复用位置钱开始正常推理，不会回退到 token 0 重新推理
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens,
-                        num_new_computed_tokens=0,
-                        new_computed_blocks=(
-                            self.kv_cache_manager.empty_kv_cache_blocks
-                        ),
-                        num_lookahead_tokens=effective_lookahead_tokens,
-                        num_external_computed_tokens=0,
-                        delay_cache_blocks=False,
-                        num_encoder_tokens=num_encoder_tokens,
-                        full_sequence_must_fit=self.scheduler_reserve_full_isl,
-                        reserved_blocks=0,
-                        has_scheduled_reqs=bool(self.running),
-                    )
-                    _log_segmentia_lookup_event(
-                        "segmentia_lookup_allocation_fallback",
-                        request.request_id,
-                        lookup_cursor=segmentia_state.cursor,
-                        retained_local_tokens=request.num_computed_tokens,
-                        local_tokens_to_schedule=num_new_tokens,
-                        allocated=new_blocks is not None,
-                        phase=segmentia_state.phase,
-                    )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+
+                    if (
+                        is_cskcache_reentry
+                        and cskcache_state is not None
+                        and cskcache_state.phase == "activated"
+                    ):
+                        self._release_cskcache_lease(cskcache_state)
+                        cskcache_state.phase = "fallback"
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -2055,6 +1137,12 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens,
                     )
                     if (
+                        is_cskcache_reentry
+                        and cskcache_state is not None
+                        and cskcache_state.phase == "activated"
+                    ):
+                        self._handoff_cskcache_lease(cskcache_state)
+                    if (
                         self.connector_prefix_cache_stats is not None
                         and connector_prefix_cache_queries != 0
                     ):
@@ -2063,10 +1151,6 @@ class Scheduler(SchedulerInterface):
                             num_hits=connector_prefix_cache_hits,
                             preempted=request.num_preemptions > 0,
                         )
-
-                self._finish_segmentia_lookup(
-                    request, num_external_computed_tokens
-                )
 
                 request = request_queue.pop_request()
                 if load_kv_async:
@@ -2110,7 +1194,7 @@ class Scheduler(SchedulerInterface):
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
-                elif request.status == RequestStatus.WAITING_FOR_SEGMENT_LOOKUP:
+                elif request.status == RequestStatus.WAITING_FOR_CSKCACHE:
                     scheduled_resumed_reqs.append(request)
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
@@ -2146,28 +1230,6 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
-
-                bank = self._segmentia_shared_kv_bank
-                scheduled_binding = (
-                    bank.get_request_binding(request_id)
-                    if bank is not None
-                    else None
-                )
-                if scheduled_binding is not None:
-                    plan_key = scheduled_binding.key
-                    if segmentia_shared_batch_key is None:
-                        segmentia_shared_batch_key = plan_key
-                    elif segmentia_shared_batch_key != plan_key:
-                        raise RuntimeError(
-                            "scheduled READY followers use different Bank keys"
-                        )
-                if (
-                    segmentia_shared_plan is not None
-                    and segmentia_shared_plan.load_bank
-                ):
-                    # A LOADING owner remains isolated from every other
-                    # request until the worker publishes its Bank.
-                    break
 
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
@@ -2281,9 +1343,6 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
-            segmentia_shared_kv=self._build_segmentia_shared_kv_batch(
-                num_scheduled_tokens
-            ),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -2291,7 +1350,6 @@ class Scheduler(SchedulerInterface):
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
         if self.connector is not None:
-            # worker 拿到 connector 元数据
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
 
@@ -2339,13 +1397,6 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
-        segmentia_state = self._segmentia_lookups.get(request.request_id)
-        if segmentia_state is not None:
-            if segmentia_state.phase == "activated":
-                self.connector.rollback_segmentia_activation(request)
-            # A genuinely preempted request loses [0, P), so it resumes as an
-            # ordinary request instead of replaying a stale boundary state.
-            self._release_segmentia_lookup_state(request.request_id)
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
@@ -2716,8 +1767,8 @@ class Scheduler(SchedulerInterface):
 
     def update_from_output(
         self,
-        scheduler_output: SchedulerOutput,   # 调度器本次 step 下发的调度计划（哪些请求、多少 token、投机解码草稿 token、KV 缓存块信息等）
-        model_runner_output: ModelRunnerOutput, # GPU 模型推理返回结果（采样 token、logprob、专家路由、KV 加载失败块、CUDA Graph 统计、池化输出等）
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
@@ -2730,11 +1781,6 @@ class Scheduler(SchedulerInterface):
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
-        # 延迟释放 KV 缓存块处理（异步内存回收）
-        # vLLM 支持延迟释放 KV 缓存块（defer_block_free）：
-        # 1、GPU 异步拷贝、CUDA Graph 执行时，不能推理完立刻释放 KV 块，会出现野内存；
-        # 2、每完成一轮有效 step，调用 _drain_deferred_frees 批量释放之前积压的待回收 KV 缓存块；
-        # 3、前提：本轮确实调度了 token（非空 step）。
         if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
             self.processed_step_seq += 1
             self._drain_deferred_frees()
@@ -2743,9 +1789,7 @@ class Scheduler(SchedulerInterface):
         if self.perf_metrics and self.perf_metrics.is_enabled():
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
 
-        # key = 客户端编号，value = 该客户端所有请求本轮输出结构体，最终返回给前端；
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
-        # 全局汇总本轮投机解码接受 / 拒绝 token 统计；
         spec_decoding_stats: SpecDecodingStats | None = None
 
         failed_kv_load_req_ids = None
@@ -2753,28 +1797,16 @@ class Scheduler(SchedulerInterface):
             # These blocks contain externally computed tokens that failed to
             # load. Identify affected requests and adjust their computed token
             # count to trigger recomputation of the invalid blocks.
-            # 如果跨机 KV 加载失败（invalid_block_ids，远端 KV 块读取损坏 / 超时）；
-            # _handle_invalid_blocks 找到所有受影响的请求 ID 存入failed_kv_load_req_ids；
-            # 后续循环中直接跳过这些请求，单独做报错处理。
             failed_kv_load_req_ids = self._handle_invalid_blocks(
                 kv_connector_output.invalid_block_ids,
                 num_scheduled_tokens,
             )
-
-        # A shared Bank load acknowledgement belongs to this completed model
-        # step. Commit it before sampled tokens can finish the load owner and
-        # release its request lease in _free_request(). Other connector
-        # completion signals retain their existing post-output ordering.
-        if kv_connector_output:
-            self._apply_segmentia_shared_load_results(kv_connector_output)
 
         # Persist per-step routed experts into the scheduler-side slot
         # buffer (CPU->CPU fancy-index assign; ~few MB per step).
         # MUST precede the per-request routing reads below: stopped
         # requests may terminate on tokens generated in this very step,
         # whose routing was just D2H'd into model_runner_output.
-        # 落地 MoE 专家路由数据
-        # 必须在请求循环前执行：部分请求会在本轮停止、释放，路由数据仅本轮有效，先落盘避免丢失。
         routing_data = None
         routing_offsets: dict[str, int] = {}
         if model_runner_output.routed_experts is not None:
@@ -2786,7 +1818,6 @@ class Scheduler(SchedulerInterface):
             )
             # Build offset map using model runner's request order
             # (input_batch ordering), NOT scheduler dict order.
-            #  构建每个请求在批量路由数组中的偏移
             offset = 0
             for rid in model_runner_output.req_ids:
                 routing_offsets[rid] = offset
@@ -2795,21 +1826,18 @@ class Scheduler(SchedulerInterface):
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
-        stopped_running_reqs: set[Request] = set() # 正常运行中本轮结束的请求
-        stopped_preempted_reqs: set[Request] = set()  # 被抢占后本轮结束的请求
-        # 遍历本轮所有调度请求（核心大循环，性能瓶颈处）
+        stopped_running_reqs: set[Request] = set()
+        stopped_preempted_reqs: set[Request] = set()
+        cskcache_waiting_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
             if request is not None:
-                # 减少请求的飞行 token 计数（in_flight：已下发 GPU 但未返回的 token）；
                 request.num_in_flight_tokens -= num_tokens_scheduled
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
-                # KV 加载失败请求直接跳过后续处理，统一后置报错；
                 continue
             if request is None or request.is_finished():
-                # 请求已被中止 / 提前完成（异步调度、流水线并行场景）直接跳过。
                 # The request is already finished. This can happen if the
                 # request is aborted while the model is executing it (e.g.,
                 # in pipeline parallelism or in async scheduling).
@@ -2819,14 +1847,11 @@ class Scheduler(SchedulerInterface):
                 # In this case, we use is_finished() to check.
                 continue
 
-            # 取出该请求本轮生成 token、投机解码草稿 token
             req_index = model_runner_output.req_id_to_index[req_id]
-            # 建立调度请求 ID ↔ 模型输出 batch 内下标映射，取出采样 token
-            # 就是模型本轮解码采样出来的新 token
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
-            # 同时取出本轮投机解码预先生成的草稿 token
+
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
@@ -2862,8 +1887,6 @@ class Scheduler(SchedulerInterface):
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
-                # 释放编码器输入（仅多模态 /encoder-decoder 模型）
-                # 图文、多模态请求，推理完成后释放图片编码张量显存。
                 self._free_encoder_inputs(request)
 
             stopped = False
@@ -2876,21 +1899,16 @@ class Scheduler(SchedulerInterface):
             num_output_tokens_before = len(request._output_token_ids)
 
             # Check for stop and update request status.
-            # 更新 token、判断请求是否停止（长度 /eos/ 池化完成）
             if new_token_ids:
-                # 生成文本类：_update_request_with_output 追加 token 到请求输出列表，
-                # 判断是否触发停止（EOS、max_tokens、stop 词）；
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
-                # 嵌入 / 池化任务：只要返回 pooler_output 直接标记完成，不需要生成 token。
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
             if new_token_ids and self.structured_output_manager.should_advance(request):
-                # 结构化输出（JSON/Grammar 约束）语法校验
                 struct_output_request = request.structured_output_request
                 assert struct_output_request is not None
                 grammar = struct_output_request.grammar
@@ -2898,9 +1916,6 @@ class Scheduler(SchedulerInterface):
                 # new_token_ids can be a mixed block of reasoning content, then
                 # the reasoning end marker, then the start of the grammar content.
                 # Trim the reasoning content so the grammar only sees grammar content.
-                # 开启guided_decoding结构化输出时：
-                # 先裁剪掉模型思考区 token，仅把结构化内容送入语法校验器；
-                # 如果 token 不符合 JSON / 自定义语法规则，直接标记请求异常终止。
                 advance_token_ids = (
                     self.structured_output_manager.trim_reasoning_for_advance(
                         request, new_token_ids
@@ -2925,11 +1940,9 @@ class Scheduler(SchedulerInterface):
                 and routing_data is not None
                 and new_token_ids
             ):
-                # 提取该请求对应的 MoE 专家路由数据
                 req_offset = routing_offsets[req_id]
                 end = req_offset + num_tokens_scheduled
                 block_ids = self._re_block_ids.pop(req_id, [])
-                # 区分预填充 / 普通解码 / 投机解码三种场景截取路由片段
                 if num_output_tokens_before == 0:
                     # Prefill completed: read full prompt routing from
                     # slot buffer using the block-ID snapshot taken at
@@ -2945,47 +1958,59 @@ class Scheduler(SchedulerInterface):
                         assert prompt_start < request.num_prompt_tokens
                     else:
                         prompt_start = 0
-                    # Prefill首次推理：读取完整prompt专家路由
                     routed_experts = self.routed_experts_mgr.get(
                         block_ids,
                         request.num_prompt_tokens,
                         token_start=prompt_start,
                     )
                 else:
-                    # 投机解码：取前半段被接受token的路由
                     if scheduled_spec_token_ids:
                         # Spec decode: accepted tokens at the START of
                         # the scheduled range, rejected at the end.
-                        # 投机解码：取前半段被接受token的路由
                         routed_experts = routing_data[
                             req_offset : req_offset + len(new_token_ids)
                         ]
                     else:
                         # Normal decode / re-prefill: token(s) at the END.
-                         # 普通单token解码：取调度区间末尾token路由
                         routed_experts = routing_data[end - len(new_token_ids) : end]
 
             finish_reason = None
-            # 处理已停止请求：释放 KV 缓存、标记完成状态
             if stopped:
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
-                # 先记录停止原因（长度限制、EOS、语法错误等）
                 finish_reason = request.get_finished_reason()
-                # _handle_stopped_request 判断是否真正结束（流式场景可能临时暂停，不销毁）
                 finished = self._handle_stopped_request(request)
-                # 真正结束：_free_request 释放 KV 缓存、编码器资源，返回 KV 跨机传输参数
                 if finished:
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
 
-                # 区分运行中停止 / 抢占后停止，存入对应集合
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 else:
                     stopped_preempted_reqs.add(request)
 
+            cskcache_state = self._cskcache_reuses.get(req_id)
+            if (
+                cskcache_state is not None
+                and cskcache_state.phase == "initial"
+                and not stopped
+                and not new_token_ids
+                and request.status == RequestStatus.RUNNING
+                and request.num_computed_tokens
+                == cskcache_state.plan["reuse_start"]
+                and request.num_in_flight_tokens == 0
+            ):
+                cskcache_state.phase = "waiting"
+                request.status = RequestStatus.WAITING_FOR_CSKCACHE
+                self._inflight_prefills.discard(request)
+                cskcache_waiting_reqs.add(request)
+                profile_event(
+                    "csk_reuse_boundary_ready",
+                    request.request_id,
+                    ticket=cskcache_state.ticket,
+                    reuse_start=cskcache_state.plan["reuse_start"],
+                )
+
             # Extract sample logprobs if needed.
-            # 如果用户开启num_logprobs，从全局 logprob 张量切片出当前请求 token 对数概率；
             if (
                 request.sampling_params is not None
                 and request.sampling_params.num_logprobs is not None
@@ -3028,43 +2053,21 @@ class Scheduler(SchedulerInterface):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
-            # The first local chunk has reached P. Keep the request RUNNING;
-            # the next scheduling pass consumes the already-submitted probe.
-            segmentia_state = self._segmentia_lookups.get(req_id)
-            if (
-                segmentia_state is not None
-                and segmentia_state.phase == "initial"
-                and not stopped
-                and not new_token_ids
-                and request.status == RequestStatus.RUNNING
-                and request.num_computed_tokens == segmentia_state.cursor
-                and request.num_in_flight_tokens == 0
-            ):
-                segmentia_state.phase = "boundary_ready"
-                _log_segmentia_lookup_event(
-                    "segmentia_lookup_boundary_ready",
-                    request.request_id,
-                    lookup_cursor=segmentia_state.cursor,
-                    num_computed_tokens=request.num_computed_tokens,
-                    num_in_flight_tokens=request.num_in_flight_tokens,
-                    phase=segmentia_state.phase,
-                )
-
         # Remove the stopped requests from the running and waiting queues.
-        # 循环结束，清理调度队列
-        # Remove genuinely stopped requests from the running queue.
         if stopped_running_reqs:
             self.running = remove_all(self.running, stopped_running_reqs)
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
+        if cskcache_waiting_reqs:
+            self.running = remove_all(self.running, cskcache_waiting_reqs)
+            for request in cskcache_waiting_reqs:
+                self.skipped_waiting.prepend_request(request)
 
-        # 统一处理 KV 加载失败的异常请求
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
             for request in requests:
-                #  给对应客户端追加错误输出EngineCoreOutput
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=request.request_id,
@@ -3076,7 +2079,6 @@ class Scheduler(SchedulerInterface):
                 )
 
         # KV Connector: update state for finished KV Transfers.
-        # 更新分布式 KV 连接器状态 
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
 
@@ -3158,7 +2160,7 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
             RequestStatus.WAITING_FOR_REMOTE_KVS,
             RequestStatus.WAITING_FOR_STREAMING_REQ,
-            RequestStatus.WAITING_FOR_SEGMENT_LOOKUP,
+            RequestStatus.WAITING_FOR_CSKCACHE,
         )
 
     def _enqueue_waiting_request(self, request: Request) -> None:
@@ -3327,14 +2329,13 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
-            # 新请求准入时识别 lmcache_segmentia_lookup kv_transfer_params
-            self._register_segmentia_lookup(request)
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:
                 self.connector.on_new_request(request)
+            self._register_cskcache_reuse(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
@@ -3407,7 +2408,7 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
-        self._release_segmentia_lookup_state(request.request_id)
+        self._release_cskcache_state(request.request_id)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing
@@ -3784,38 +2785,25 @@ class Scheduler(SchedulerInterface):
     def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
         """
         Try to promote a blocked waiting request back to schedulable states.
-        尝试把处于阻塞等待状态的请求，解除阻塞、切换回可被调度的正常等待状态（WAITING / PREEMPTED），返回是否成功解除阻塞
         """
-        if request.status == RequestStatus.WAITING_FOR_SEGMENT_LOOKUP:
-            # Leave the dedicated status intact. The waiting scheduling path
-            # activates the ready result and changes the request to RUNNING
-            # only after slot allocation succeeds.
-            state = self._segmentia_lookups[request.request_id]
-            if state.ready_matched_end is not None:
-                return True
-            matched_end = self.connector.poll_segmentia_probe(request)
-            if matched_end is None:
+        if request.status == RequestStatus.WAITING_FOR_CSKCACHE:
+            state = self._cskcache_reuses[request.request_id]
+            readiness = self.connector.query_csk_readiness(
+                state.ticket, request.request_id
+            )
+            if readiness.get("status") == "loading":
                 return False
-            state.ready_matched_end = matched_end
+            state.readiness = readiness
             return True
 
         if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
             # finished_recving_kv_req_ids is populated during
             # update_from_output(), based on worker-side connector signals
             # in KVConnectorOutput.finished_recving
-            # 等待远端 KV 缓存拉取完成
-            # 场景：分布式 KV Connector，请求需要加载远端机器的 KV 块，进入阻塞等待。
             if request.request_id not in self.finished_recving_kv_req_ids:
-                return False # KV还没拉完，不能放行
+                return False
             self._update_waiting_for_remote_kv(request)
-            # 判断最终切到哪种状态
-            segmentia_state = self._segmentia_lookups.get(request.request_id)
-            segmentia_is_resumed = (
-                segmentia_state is not None
-                and segmentia_state.phase in ("lookup_complete", "local_fallback")
-            )
-            # 发生过抢占 或 二次检索恢复 → PREEMPTED（被抢占请求，调度优先级逻辑不同）
-            if request.num_preemptions or segmentia_is_resumed:
+            if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:
                 request.status = RequestStatus.WAITING

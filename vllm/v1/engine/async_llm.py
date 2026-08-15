@@ -370,6 +370,7 @@ class AsyncLLM(EngineClient):
             request.reasoning_parser_kwargs = reasoning_parser_kwargs
 
         self.input_processor.assign_request_id(request)
+        await self._authenticate_cskcache_candidate(request)
 
         # We start the output_handler on the first call to add_request() so
         # we can call __init__ before the event loop, which enables us
@@ -400,6 +401,86 @@ class AsyncLLM(EngineClient):
                 child_request, prompt_text, parent_request, idx, queue
             )
         return queue
+
+    async def _authenticate_cskcache_candidate(
+        self, request: EngineCoreRequest
+    ) -> None:
+        """Bind one server-created CSKCache ticket to the internal request ID.
+
+        Chat serving can identify the Skill Tool observation before vLLM has
+        generated its collision-resistant EngineCore request ID.  It therefore
+        passes only a temporary ticket candidate.  This method runs after
+        ``assign_request_id()`` and replaces that candidate with an authenticated
+        binding before the request crosses into EngineCore.
+        """
+
+        sampling_params = request.sampling_params
+        if sampling_params is None:
+            return
+        extra_args = dict(sampling_params.extra_args or {})
+        raw_transfer_params = extra_args.get("kv_transfer_params")
+        if not isinstance(raw_transfer_params, dict):
+            return
+
+        transfer_params = dict(raw_transfer_params)
+        candidate = transfer_params.pop("cskcache_candidate", None)
+        # This value is server-owned.  Never admit one supplied by another
+        # entry point without authenticating its candidate in this process.
+        transfer_params.pop("cskcache_verified", None)
+        if transfer_params:
+            extra_args["kv_transfer_params"] = transfer_params
+        else:
+            extra_args.pop("kv_transfer_params", None)
+        sampling_params.extra_args = extra_args or None
+
+        if candidate is None:
+            return
+        ticket = candidate.get("ticket") if isinstance(candidate, dict) else None
+        if not isinstance(ticket, str) or not ticket:
+            return
+
+        async def cancel_candidate(reason: str) -> None:
+            try:
+                await self.cancel_csk_prefetch(ticket, reason)
+            except Exception:
+                logger.warning(
+                    "Failed to cancel CSKCache candidate %s", ticket, exc_info=True
+                )
+
+        if sampling_params.n != 1:
+            await cancel_candidate("parallel_sampling_unsupported")
+            return
+        prompt_token_ids = request.prompt_token_ids
+        if prompt_token_ids is None:
+            await cancel_candidate("token_authentication_unavailable")
+            return
+
+        try:
+            verified = await self.authenticate_csk_request(
+                ticket, request.request_id, list(prompt_token_ids)
+            )
+        except Exception:
+            logger.warning(
+                "CSKCache request authentication failed for %s",
+                request.request_id,
+                exc_info=True,
+            )
+            await cancel_candidate("authentication_rpc_failed")
+            return
+
+        if not isinstance(verified, dict):
+            await cancel_candidate("authentication_failed")
+            return
+        if (
+            verified.get("ticket") != ticket
+            or verified.get("request_id") != request.request_id
+        ):
+            await cancel_candidate("authentication_identity_mismatch")
+            return
+
+        transfer_params["cskcache_verified"] = verified
+        extra_args["kv_transfer_params"] = transfer_params
+        sampling_params.extra_args = extra_args
 
     async def _add_request(
         self,
@@ -723,6 +804,36 @@ class AsyncLLM(EngineClient):
 
         if self.log_requests:
             logger.info("Aborted request(s) %s.", ",".join(request_ids))
+
+    async def submit_csk_prefetch(self, ticket: str, skill_name: str) -> bool:
+        """Forward a T0 Skill prefetch hint to the scheduler connector."""
+        return bool(
+            await self.engine_core.call_utility_async(
+                "submit_csk_prefetch", ticket, skill_name
+            )
+        )
+
+    async def inspect_csk_tool_observation(
+        self, ticket: str, tool_name: str, content: str
+    ) -> bool:
+        return bool(
+            await self.engine_core.call_utility_async(
+                "inspect_csk_tool_observation", ticket, tool_name, content
+            )
+        )
+
+    async def authenticate_csk_request(
+        self, ticket: str, request_id: str, prompt_token_ids: list[int]
+    ) -> dict[str, Any] | None:
+        result = await self.engine_core.call_utility_async(
+            "authenticate_csk_request", ticket, request_id, prompt_token_ids
+        )
+        return result if isinstance(result, dict) else None
+
+    async def cancel_csk_prefetch(self, ticket: str, reason: str) -> None:
+        await self.engine_core.call_utility_async(
+            "cancel_csk_prefetch", ticket, reason
+        )
 
     async def notify_kv_transfer_request_rejected(
         self,

@@ -83,11 +83,11 @@ def test_record_structured_skill_action_after_tool_parsing(
     )
 
     _record_structured_skill_action(
-        "chatcmpl-segmentia-window-request-a", tool_call, 123456, 654321
+        "chatcmpl-cskcache-window-request-a", tool_call, 123456, 654321
     )
 
     record = json.loads(trace_path.read_text(encoding="utf-8"))
-    assert record["request_id"] == "chatcmpl-segmentia-window-request-a"
+    assert record["request_id"] == "chatcmpl-cskcache-window-request-a"
     assert record["tool_call_id"] == "tool-call-1"
     assert record["skill_name"] == "docx"
     assert record["skill_action_ready_unix_ns"] == 123456

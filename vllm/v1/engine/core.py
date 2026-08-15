@@ -30,6 +30,7 @@ from vllm.distributed import (
 )
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
+from vllm.request_timeline import record_request_timeline
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -89,10 +90,8 @@ from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
-_SEGMENTIA_PROFILE_ENABLED = os.getenv("SEGMENTIA_PROFILE", "0") == "1"
-_SEGMENTIA_PROFILE_MARKER = "SEGMENTIA_PROFILE_EVENT"
 _SCHEDULE_WINDOW_TRACE_PATH = os.getenv("VLLM_SCHEDULE_WINDOW_TRACE_PATH")
-_SCHEDULE_WINDOW_REQUEST_PREFIX = "chatcmpl-segmentia-window-"
+_SCHEDULE_WINDOW_REQUEST_PREFIX = "chatcmpl-cskcache-window-"
 
 
 def _linux_boot_id() -> str:
@@ -105,17 +104,6 @@ def _linux_boot_id() -> str:
 
 
 _BOOT_ID = _linux_boot_id()
-
-
-def _log_segmentia_profile_event(event: str, **fields: Any) -> None:
-    if not _SEGMENTIA_PROFILE_ENABLED:
-        return
-    payload = {"event": event, "monotonic_ns": time.perf_counter_ns(), **fields}
-    logger.info(
-        "%s %s",
-        _SEGMENTIA_PROFILE_MARKER,
-        json.dumps(payload, sort_keys=True, separators=(",", ":")),
-    )
 
 
 def _record_schedule_window_admission(
@@ -540,12 +528,10 @@ class EngineCore:
                 "Disabling ECTransfer for this request."
             )
 
-        lookup = (request.kv_transfer_params or {}).get(
-            "lmcache_segmentia_lookup"
-        )
+        verified = (request.kv_transfer_params or {}).get("cskcache_verified")
         source_tool_call_id = (
-            lookup.get("source_tool_call_id")
-            if isinstance(lookup, dict)
+            verified.get("ticket")
+            if isinstance(verified, dict)
             else None
         )
         trace_schedule_window = (
@@ -558,6 +544,11 @@ class EngineCore:
         )
         schedule_window_monotonic_ns = (
             time.monotonic_ns() if trace_schedule_window else None
+        )
+        record_request_timeline(
+            "scheduler_add_request",
+            request.request_id,
+            prompt_tokens=request.num_tokens,
         )
         self.scheduler.add_request(request)
         if (
@@ -686,11 +677,8 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        step_started = time.perf_counter_ns()
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-        schedule_finished = time.perf_counter_ns()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        submit_finished = time.perf_counter_ns()
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
@@ -699,7 +687,6 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
-            model_finished = time.perf_counter_ns()
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -707,36 +694,6 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
-        update_finished = time.perf_counter_ns()
-        if scheduler_output.num_scheduled_tokens:
-            _log_segmentia_profile_event(
-                "engine_step",
-                request_ids=list(scheduler_output.num_scheduled_tokens),
-                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                model_output_req_ids=list(getattr(model_output, "req_ids", ())),
-                sampled_token_counts=[
-                    len(token_ids)
-                    for token_ids in (
-                        getattr(model_output, "sampled_token_ids", None) or ()
-                    )
-                ],
-                request_states={
-                    request_id: {
-                        "status": str(request.status),
-                        "num_computed_tokens": request.num_computed_tokens,
-                        "num_prompt_tokens": request.num_prompt_tokens,
-                        "num_output_tokens": request.num_output_tokens,
-                        "num_in_flight_tokens": request.num_in_flight_tokens,
-                    }
-                    for request_id in scheduler_output.num_scheduled_tokens
-                    if (request := self.scheduler.requests.get(request_id)) is not None
-                },
-                schedule_ms=(schedule_finished - step_started) / 1_000_000,
-                submit_ms=(submit_finished - schedule_finished) / 1_000_000,
-                model_wait_ms=(model_finished - submit_finished) / 1_000_000,
-                update_ms=(update_finished - model_finished) / 1_000_000,
-                total_ms=(update_finished - step_started) / 1_000_000,
-            )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -918,6 +875,36 @@ class EngineCore:
         return self.scheduler.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    def submit_csk_prefetch(self, ticket: str, skill_name: str) -> bool:
+        """Submit T0 prefetch without admitting request B to the scheduler."""
+        connector = self.scheduler.get_kv_connector()
+        if connector is None:
+            return False
+        return connector.submit_csk_prefetch(ticket, skill_name)
+
+    def inspect_csk_tool_observation(
+        self, ticket: str, tool_name: str, content: str
+    ) -> bool:
+        connector = self.scheduler.get_kv_connector()
+        if connector is None:
+            return False
+        return connector.inspect_csk_tool_observation(ticket, tool_name, content)
+
+    def authenticate_csk_request(
+        self, ticket: str, request_id: str, prompt_token_ids: list[int]
+    ) -> dict[str, Any] | None:
+        connector = self.scheduler.get_kv_connector()
+        if connector is None:
+            return None
+        return connector.authenticate_csk_request(
+            ticket, request_id, prompt_token_ids
+        )
+
+    def cancel_csk_prefetch(self, ticket: str, reason: str) -> None:
+        connector = self.scheduler.get_kv_connector()
+        if connector is not None:
+            connector.cancel_csk_prefetch(ticket, reason)
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.

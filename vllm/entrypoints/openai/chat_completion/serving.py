@@ -384,8 +384,13 @@ class OpenAIServingChat(GenerateBaseServing):
         observations = _trailing_tool_observations(request.messages)
         observation_tasks = [
             asyncio.create_task(
-                self.engine_client.inspect_csk_tool_observation(
-                    ticket, tool_name, content
+                self.engine_client.execute_connector_control(
+                    "cskcache.inspect_tool_observation",
+                    {
+                        "ticket": ticket,
+                        "tool_name": tool_name,
+                        "content": content,
+                    },
                 )
             )
             for ticket, tool_name, content in observations
@@ -417,8 +422,12 @@ class OpenAIServingChat(GenerateBaseServing):
                 )
                 await asyncio.gather(
                     *(
-                        self.engine_client.cancel_csk_prefetch(
-                            observation[0], "request_render_failed"
+                        self.engine_client.execute_connector_control(
+                            "cskcache.cancel_prefetch",
+                            {
+                                "ticket": observation[0],
+                                "reason": "request_render_failed",
+                            },
                         )
                         for observation, accepted in zip(
                             observations, inspection_results, strict=True
@@ -458,8 +467,12 @@ class OpenAIServingChat(GenerateBaseServing):
                 )
                 await asyncio.gather(
                     *(
-                        self.engine_client.cancel_csk_prefetch(
-                            observation[0], "multiple_skill_observations"
+                        self.engine_client.execute_connector_control(
+                            "cskcache.cancel_prefetch",
+                            {
+                                "ticket": observation[0],
+                                "reason": "multiple_skill_observations",
+                            },
                         )
                         for observation in accepted_observations
                     ),
@@ -489,7 +502,10 @@ class OpenAIServingChat(GenerateBaseServing):
                     if len(engine_inputs) != 1
                     else "parallel_sampling_unsupported"
                 )
-                await self.engine_client.cancel_csk_prefetch(ticket, reason)
+                await self.engine_client.execute_connector_control(
+                    "cskcache.cancel_prefetch",
+                    {"ticket": ticket, "reason": reason},
+                )
                 accepted_observations = []
 
         model_name = self.models.model_name(lora_request)
@@ -1227,8 +1243,12 @@ class OpenAIServingChat(GenerateBaseServing):
                 )
                 if _CSK_T0_PREFETCH_ENABLED and skill_name is not None:
                     try:
-                        accepted = await self.engine_client.submit_csk_prefetch(
-                            tool_call.id, skill_name
+                        accepted = await self.engine_client.execute_connector_control(
+                            "cskcache.submit_prefetch",
+                            {
+                                "ticket": tool_call.id,
+                                "skill_name": skill_name,
+                            },
                         )
                     except Exception:
                         # T0 prefetch is speculative. Its failure must not turn a

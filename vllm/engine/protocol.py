@@ -109,27 +109,10 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
-    async def submit_csk_prefetch(self, ticket: str, skill_name: str) -> bool:
-        """Submit speculative Agent Skill KV prefetch after request A."""
-        ...
-
-    @abstractmethod
-    async def inspect_csk_tool_observation(
-        self, ticket: str, tool_name: str, content: str
-    ) -> bool:
-        """Check one newly appended Tool result against a live T0 ticket."""
-        ...
-
-    @abstractmethod
-    async def authenticate_csk_request(
-        self, ticket: str, request_id: str, prompt_token_ids: list[int]
-    ) -> dict[str, Any] | None:
-        """Authenticate final prompt tokens and bind them to a T0 ticket."""
-        ...
-
-    @abstractmethod
-    async def cancel_csk_prefetch(self, ticket: str, reason: str) -> None:
-        """Release an unusable T0 transaction before scheduler admission."""
+    async def execute_connector_control(
+        self, command: str, payload: dict[str, Any]
+    ) -> Any:
+        """Execute an opaque control-plane command on the active connector."""
         ...
 
     @abstractmethod

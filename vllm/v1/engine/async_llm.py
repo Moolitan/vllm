@@ -441,7 +441,10 @@ class AsyncLLM(EngineClient):
 
         async def cancel_candidate(reason: str) -> None:
             try:
-                await self.cancel_csk_prefetch(ticket, reason)
+                await self.execute_connector_control(
+                    "cskcache.cancel_prefetch",
+                    {"ticket": ticket, "reason": reason},
+                )
             except Exception:
                 logger.warning(
                     "Failed to cancel CSKCache candidate %s", ticket, exc_info=True
@@ -456,8 +459,13 @@ class AsyncLLM(EngineClient):
             return
 
         try:
-            verified = await self.authenticate_csk_request(
-                ticket, request.request_id, list(prompt_token_ids)
+            verified = await self.execute_connector_control(
+                "cskcache.authenticate_request",
+                {
+                    "ticket": ticket,
+                    "request_id": request.request_id,
+                    "prompt_token_ids": list(prompt_token_ids),
+                },
             )
         except Exception:
             logger.warning(
@@ -805,34 +813,11 @@ class AsyncLLM(EngineClient):
         if self.log_requests:
             logger.info("Aborted request(s) %s.", ",".join(request_ids))
 
-    async def submit_csk_prefetch(self, ticket: str, skill_name: str) -> bool:
-        """Forward a T0 Skill prefetch hint to the scheduler connector."""
-        return bool(
-            await self.engine_core.call_utility_async(
-                "submit_csk_prefetch", ticket, skill_name
-            )
-        )
-
-    async def inspect_csk_tool_observation(
-        self, ticket: str, tool_name: str, content: str
-    ) -> bool:
-        return bool(
-            await self.engine_core.call_utility_async(
-                "inspect_csk_tool_observation", ticket, tool_name, content
-            )
-        )
-
-    async def authenticate_csk_request(
-        self, ticket: str, request_id: str, prompt_token_ids: list[int]
-    ) -> dict[str, Any] | None:
-        result = await self.engine_core.call_utility_async(
-            "authenticate_csk_request", ticket, request_id, prompt_token_ids
-        )
-        return result if isinstance(result, dict) else None
-
-    async def cancel_csk_prefetch(self, ticket: str, reason: str) -> None:
-        await self.engine_core.call_utility_async(
-            "cancel_csk_prefetch", ticket, reason
+    async def execute_connector_control(
+        self, command: str, payload: dict[str, Any]
+    ) -> Any:
+        return await self.engine_core.call_utility_async(
+            "execute_connector_control", command, payload
         )
 
     async def notify_kv_transfer_request_rejected(

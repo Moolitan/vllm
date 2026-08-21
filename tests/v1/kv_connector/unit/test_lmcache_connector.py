@@ -197,43 +197,6 @@ class TestGetKVConnectorKVCacheEvents:
         assert events[0].parent_block_hash is None
 
 
-class TestCSKCacheControlDelegation:
-    def test_forwards_all_cskcache_control_apis(self):
-        connector = object.__new__(LMCacheConnectorV1)
-        connector._lmcache_engine = MagicMock()
-        connector._lmcache_engine.submit_csk_prefetch.return_value = True
-        connector._lmcache_engine.inspect_csk_tool_observation.return_value = True
-        connector._lmcache_engine.authenticate_csk_request.return_value = {"bound": True}
-        connector._lmcache_engine.prepare_csk_reuse.return_value = {"plan": True}
-        connector._lmcache_engine.query_csk_readiness.return_value = {"status": "ready"}
-        connector._lmcache_engine.activate_csk_reuse.return_value = {"active": True}
-        connector._lmcache_engine.release_csk_reuse.return_value = True
-
-        assert connector.submit_csk_prefetch("call-1", "docx")
-        assert connector.inspect_csk_tool_observation("call-1", "skill", "body")
-        assert connector.authenticate_csk_request("call-1", "req-1", [1, 2]) == {
-            "bound": True
-        }
-        assert connector.prepare_csk_reuse("call-1", "req-1", 16) == {
-            "plan": True
-        }
-        assert connector.query_csk_readiness("call-1", "req-1") == {
-            "status": "ready"
-        }
-        assert connector.activate_csk_reuse("call-1", "req-1") == {
-            "active": True
-        }
-        assert connector.release_csk_reuse("call-1")
-        connector.cancel_csk_prefetch("call-1", "request_failed")
-
-        connector._lmcache_engine.submit_csk_prefetch.assert_called_once_with(
-            "call-1", "docx"
-        )
-        connector._lmcache_engine.cancel_csk_prefetch.assert_called_once_with(
-            "call-1", "request_failed"
-        )
-
-
 class TestUpdateConnectorOutput:
     """Test update_connector_output method."""
 

@@ -633,28 +633,6 @@ class KVCacheManager:
         """Get the blocks of a request."""
         return self.create_kv_cache_blocks(self.coordinator.get_blocks(request_id))
 
-    def append_shared_null_range(
-        self, request_id: str, start_token: int, end_token: int
-    ) -> None:
-        """Append a block-aligned virtual shared range to every KV group."""
-        managers = self.coordinator.single_type_managers
-        for manager in managers:
-            manager.validate_shared_null_range(request_id, start_token, end_token)
-        for manager in managers:
-            manager.append_shared_null_range(request_id, start_token, end_token)
-
-    def pop_shared_null_range(
-        self, request_id: str, start_token: int, end_token: int
-    ) -> None:
-        """Rollback a shared virtual range in every KV cache group."""
-        managers = self.coordinator.single_type_managers
-        for manager in managers:
-            manager.validate_shared_null_range_for_pop(
-                request_id, start_token, end_token
-            )
-        for manager in managers:
-            manager.pop_shared_null_range(request_id, start_token, end_token)
-
     def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
         """Get the block ids of a request."""
         return self.get_blocks(request_id).get_block_ids()

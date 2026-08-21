@@ -11,6 +11,8 @@ from transformers import OPTConfig
 import vllm.envs as envs
 import vllm.platforms
 import vllm.v1.core.sched.scheduler as scheduler_module
+from cskcache import ReusePlan
+from cskcache.integrations.vllm.scheduler import CSKCacheSchedulerExtension
 from vllm.config import (
     CacheConfig,
     ECTransferConfig,
@@ -101,8 +103,8 @@ def _attach_cskcache_plan(scheduler, request, *, status="ready"):
         "reuse_end": reuse_end,
         "source_reuse_start": source_reuse_start,
         "source_reuse_end": source_reuse_start + reuse_end - reuse_start,
-        "calibration_start": 232,
-        "calibration_end": 356,
+        "calibration_start": reuse_start - 32,
+        "calibration_end": reuse_start,
         "correction_alpha": 0.6,
         "block_alignment": alignment,
     }
@@ -115,14 +117,18 @@ def _attach_cskcache_plan(scheduler, request, *, status="ready"):
             "segment_end": plan["segment_end"],
         }
     }
-    scheduler.connector.prepare_csk_reuse = Mock(return_value=plan)
+    typed_plan = ReusePlan.from_dict(plan)
+    scheduler.connector.prepare_csk_reuse = Mock(return_value=typed_plan)
     scheduler.connector.query_csk_readiness = Mock(
         return_value={"status": status, "plan": plan, "reason": None}
     )
-    scheduler.connector.activate_csk_reuse = Mock(return_value=plan)
+    scheduler.connector.activate_csk_reuse = Mock(return_value=typed_plan)
     scheduler.connector.release_csk_reuse = Mock(return_value=True)
     scheduler.connector.update_state_after_alloc = Mock(
         wraps=scheduler.connector.update_state_after_alloc
+    )
+    scheduler.connector_scheduler = CSKCacheSchedulerExtension(
+        scheduler.connector
     )
     return plan
 
@@ -147,15 +153,15 @@ def test_cskcache_ready_reuses_only_the_aligned_suffix(tmp_path, monkeypatch):
     scheduler.add_request(request)
 
     first = scheduler.schedule()
-    assert first.num_scheduled_tokens[request.request_id] == plan["reuse_start"]
+    assert first.num_scheduled_tokens[request.request_id] == plan["calibration_start"]
     scheduler.update_from_output(first, _empty_model_runner_output(request))
-    assert scheduler._cskcache_reuses[request.request_id].phase == "waiting"
-    assert request.status == RequestStatus.WAITING_FOR_CSKCACHE
+    assert request.status == RequestStatus.WAITING_FOR_KV_CONNECTOR
 
     second = scheduler.schedule()
-    assert second.num_scheduled_tokens[request.request_id] == 1100 - plan["reuse_end"]
-    # vLLM advances both the externally installed range and this step's local
-    # prompt suffix when it builds SchedulerOutput.
+    assert (
+        second.num_scheduled_tokens[request.request_id]
+        == 1100 - plan["reuse_end"]
+    )
     assert request.num_computed_tokens == 1100
     scheduler.connector.activate_csk_reuse.assert_called_once_with(
         plan["ticket"], request.request_id
@@ -163,12 +169,11 @@ def test_cskcache_ready_reuses_only_the_aligned_suffix(tmp_path, monkeypatch):
     scheduler.connector.update_state_after_alloc.assert_called_with(
         request,
         scheduler.kv_cache_manager.get_blocks(request.request_id),
-        plan["reuse_end"] - plan["reuse_start"],
+        plan["reuse_end"] - plan["calibration_start"],
     )
-    assert (
-        scheduler._cskcache_reuses[request.request_id].host_lease_owner
-        == "worker"
-    )
+
+    scheduler.update_from_output(second, _empty_model_runner_output(request))
+    assert request.num_computed_tokens == 1100
 
     scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
     scheduler.connector.release_csk_reuse.assert_not_called()
@@ -208,14 +213,18 @@ def test_cskcache_loading_waits_with_owned_prefix_then_resumes(
 
     pending = scheduler.schedule()
     assert request.request_id not in pending.num_scheduled_tokens
-    assert request.status == RequestStatus.WAITING_FOR_CSKCACHE
+    assert request.status == RequestStatus.WAITING_FOR_KV_CONNECTOR
     assert request.num_preemptions == 0
     assert list(
         scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[0]
     ) == retained
 
     resumed = scheduler.schedule()
-    assert resumed.num_scheduled_tokens[request.request_id] == 108
+    assert (
+        resumed.num_scheduled_tokens[request.request_id]
+        == 1100 - plan["reuse_end"]
+    )
+    assert request.num_computed_tokens == 1100
     assert request.status == RequestStatus.RUNNING
     assert request.num_preemptions == 0
 
@@ -247,12 +256,12 @@ def test_cskcache_abort_while_loading_releases_scheduler_lease_once(
     scheduler.update_from_output(first, _empty_model_runner_output(request))
     scheduler.schedule()
 
-    assert request.status == RequestStatus.WAITING_FOR_CSKCACHE
+    assert request.status == RequestStatus.WAITING_FOR_KV_CONNECTOR
     scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
     scheduler.connector.release_csk_reuse.assert_called_once_with(plan["ticket"])
 
 
-def test_cskcache_fallback_continues_local_prefill_from_reuse_boundary(
+def test_cskcache_fallback_continues_local_prefill_from_calibration_boundary(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
@@ -279,11 +288,53 @@ def test_cskcache_fallback_continues_local_prefill_from_reuse_boundary(
     scheduler.update_from_output(first, _empty_model_runner_output(request))
 
     second = scheduler.schedule()
-    assert second.num_scheduled_tokens[request.request_id] == 1100 - plan["reuse_start"]
+    assert (
+        second.num_scheduled_tokens[request.request_id]
+        == 1100 - plan["calibration_start"]
+    )
     scheduler.connector.activate_csk_reuse.assert_not_called()
-    assert scheduler._cskcache_reuses[request.request_id].phase == "fallback"
     scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
     scheduler.connector.release_csk_reuse.assert_called_once_with(plan["ticket"])
+
+
+def test_cskcache_failed_install_rolls_back_to_calibration_boundary(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(vllm.platforms, "current_platform", CpuPlatform())
+    scheduler = create_scheduler(
+        model=_make_local_opt_config(tmp_path),
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+        block_size=16,
+        skip_tokenizer_init=True,
+        max_num_batched_tokens=2048,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=1100,
+        block_size=16,
+        req_ids=["csk-install-failure"],
+    )
+    plan = _attach_cskcache_plan(scheduler, request)
+    scheduler.add_request(request)
+    first = scheduler.schedule()
+    scheduler.update_from_output(first, _empty_model_runner_output(request))
+    calibration = scheduler.schedule()
+
+    (block_ids,) = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    failed_block = block_ids[plan["calibration_start"] // scheduler.block_size]
+    output = _empty_model_runner_output(request)
+    output.kv_connector_output = KVConnectorOutput(
+        invalid_block_ids={failed_block}
+    )
+    scheduler.update_from_output(calibration, output)
+
+    assert request.num_computed_tokens == plan["calibration_start"]
+    fallback = scheduler.schedule()
+    assert (
+        fallback.num_scheduled_tokens[request.request_id]
+        == 1100 - plan["calibration_start"]
+    )
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():

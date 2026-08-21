@@ -42,8 +42,8 @@ The class provides the following primitives:
 
 import enum
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Any, Literal
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import torch
 
@@ -66,6 +66,75 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
+
+
+class KVConnectorActivation(Protocol):
+    """External-KV activation result interpreted by the scheduler."""
+
+    external_tokens: int
+
+
+class KVConnectorFailedRange(Protocol):
+    """Request range invalidated by a failed connector materialization."""
+
+    request_id: str
+    recompute_from: int
+    block_ids: frozenset[int]
+
+
+class KVConnectorSchedulerExtension(Protocol):
+    """Optional mid-prefill lifecycle implemented outside the scheduler."""
+
+    def register(
+        self,
+        request: "Request",
+        *,
+        block_alignment: int,
+        async_scheduling: bool,
+    ) -> bool: ...
+
+    def limit_prefill(
+        self,
+        request_id: str,
+        *,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+    ) -> int: ...
+
+    def is_waiting(self, request_id: str) -> bool: ...
+
+    def poll(self, request_id: str) -> bool: ...
+
+    def activate(
+        self, request_id: str, *, num_computed_tokens: int
+    ) -> KVConnectorActivation: ...
+
+    def allocation_failed(self, request_id: str) -> None: ...
+
+    def handoff_to_worker(self, request_id: str) -> None: ...
+
+    def reaches_waiting_boundary(
+        self,
+        request_id: str,
+        *,
+        num_computed_tokens: int,
+        stopped: bool,
+        produced_tokens: bool,
+        request_running: bool,
+        in_flight_tokens: int,
+    ) -> bool: ...
+
+    def request_ids(self) -> tuple[str, ...]: ...
+
+    def consume_invalid_blocks(
+        self,
+        invalid_block_ids: set[int],
+        *,
+        request_block_ids: Mapping[str, Sequence[int]],
+        block_size: int,
+    ) -> tuple[tuple[KVConnectorFailedRange, ...], set[int]]: ...
+
+    def finish(self, request_id: str) -> None: ...
 
 # s_tensor_list, d_tensor_list, s_indices, d_indices, direction
 CopyBlocksOp = Callable[
@@ -534,51 +603,15 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
-    def submit_csk_prefetch(self, ticket: str, skill_name: str) -> bool:
-        """Submit an optional Agent Skill T0 prefetch operation."""
-        return False
-
-    def inspect_csk_tool_observation(
-        self, ticket: str, tool_name: str, content: str
-    ) -> bool:
-        """Check a Tool result against an optional Agent Skill transaction."""
-        return False
-
-    def authenticate_csk_request(
-        self, ticket: str, request_id: str, prompt_token_ids: list[int]
-    ) -> dict[str, Any] | None:
-        """Authenticate and bind an optional Agent Skill transaction."""
+    def get_scheduler_extension(self) -> KVConnectorSchedulerExtension | None:
+        """Return an optional connector-owned mid-prefill scheduler policy."""
         return None
 
-    def prepare_csk_reuse(
-        self, ticket: str, request_id: str, block_alignment: int
-    ) -> dict[str, Any] | None:
-        """Ask CSKCache to prepare an aligned request-local reuse plan."""
+    def execute_connector_control(
+        self, command: str, payload: Mapping[str, Any]
+    ) -> Any:
+        """Execute an optional connector-owned control-plane command."""
         return None
-
-    def query_csk_readiness(
-        self, ticket: str, request_id: str
-    ) -> dict[str, Any]:
-        """Query CSKCache host readiness without activating GPU reuse."""
-        return {
-            "status": "fallback",
-            "plan": None,
-            "reason": "cskcache_unavailable",
-        }
-
-    def activate_csk_reuse(
-        self, ticket: str, request_id: str
-    ) -> dict[str, Any] | None:
-        """Activate one ready CSKCache transaction on all worker ranks."""
-        return None
-
-    def release_csk_reuse(self, ticket: str) -> bool:
-        """Release one CSKCache transaction on all worker ranks."""
-        return False
-
-    def cancel_csk_prefetch(self, ticket: str, reason: str) -> None:
-        """Release an optional Agent Skill T0 transaction."""
-        return
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """

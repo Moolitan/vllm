@@ -256,46 +256,6 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
     # ==============================
     # Scheduler-side methods
     # ==============================
-    def submit_csk_prefetch(self, ticket: str, skill_name: str) -> bool:
-        return self._lmcache_engine.submit_csk_prefetch(ticket, skill_name)
-
-    def inspect_csk_tool_observation(
-        self, ticket: str, tool_name: str, content: str
-    ) -> bool:
-        return self._lmcache_engine.inspect_csk_tool_observation(
-            ticket, tool_name, content
-        )
-
-    def authenticate_csk_request(
-        self, ticket: str, request_id: str, prompt_token_ids: list[int]
-    ) -> dict[str, Any] | None:
-        return self._lmcache_engine.authenticate_csk_request(
-            ticket, request_id, prompt_token_ids
-        )
-
-    def prepare_csk_reuse(
-        self, ticket: str, request_id: str, block_alignment: int
-    ) -> dict[str, Any] | None:
-        return self._lmcache_engine.prepare_csk_reuse(
-            ticket, request_id, block_alignment
-        )
-
-    def query_csk_readiness(
-        self, ticket: str, request_id: str
-    ) -> dict[str, Any]:
-        return self._lmcache_engine.query_csk_readiness(ticket, request_id)
-
-    def activate_csk_reuse(
-        self, ticket: str, request_id: str
-    ) -> dict[str, Any] | None:
-        return self._lmcache_engine.activate_csk_reuse(ticket, request_id)
-
-    def release_csk_reuse(self, ticket: str) -> bool:
-        return self._lmcache_engine.release_csk_reuse(ticket)
-
-    def cancel_csk_prefetch(self, ticket: str, reason: str) -> None:
-        self._lmcache_engine.cancel_csk_prefetch(ticket, reason)
-
     def get_num_new_matched_tokens(
         self,
         request: "Request",

@@ -5,10 +5,8 @@ import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Any
-
-from cskcache import profile_event
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
@@ -25,7 +23,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorRole,
     SupportsHMA,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata,
+    KVConnectorSchedulerExtension,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -68,17 +69,6 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
-
-
-@dataclass
-class _CSKCacheReuseState:
-    """Scheduler-owned state for one authenticated CSKCache request."""
-
-    ticket: str
-    plan: dict[str, Any]
-    phase: str = "initial"
-    readiness: dict[str, Any] | None = None
-    host_lease_owner: str = "scheduler"
 
 
 class Scheduler(SchedulerInterface):
@@ -167,6 +157,12 @@ class Scheduler(SchedulerInterface):
             if multiple_inflight_batches and kv_transfer_config.is_kv_consumer:
                 self.defer_block_free = True
 
+        self.connector_scheduler: KVConnectorSchedulerExtension | None = (
+            self.connector.get_scheduler_extension()
+            if self.connector is not None
+            else None
+        )
+
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
             self.parallel_config.data_parallel_index,
@@ -198,7 +194,6 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
-        self._cskcache_reuses: dict[str, _CSKCacheReuseState] = {}
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -433,106 +428,26 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
-    def _register_cskcache_reuse(self, request: Request) -> None:
-        verified = (request.kv_transfer_params or {}).get("cskcache_verified")
-        if not isinstance(verified, dict) or self.connector is None:
-            return
-        ticket = verified.get("ticket")
-        if not isinstance(ticket, str) or verified.get("request_id") != request.request_id:
-            return
-        if self.scheduler_config.async_scheduling:
-            self.connector.cancel_csk_prefetch(ticket, "unsupported_scheduler_mode")
+    def _register_connector_schedule(self, request: Request) -> None:
+        if self.connector_scheduler is None:
             return
         alignment = math.lcm(self.hash_block_size, self.block_size)
-        plan = self.connector.prepare_csk_reuse(
-            ticket, request.request_id, alignment
-        )
-        integer_fields = (
-            "segment_start",
-            "segment_end",
-            "reuse_start",
-            "reuse_end",
-            "source_reuse_start",
-            "source_reuse_end",
-            "calibration_start",
-            "calibration_end",
-            "block_alignment",
-        )
-        valid = isinstance(plan, dict) and all(
-            isinstance(plan.get(name), int)
-            and not isinstance(plan.get(name), bool)
-            for name in integer_fields
-        )
-        if valid:
-            assert isinstance(plan, dict)
-            valid = (
-                plan.get("ticket") == ticket
-                and plan.get("request_id") == request.request_id
-                and plan.get("cache_object_id") == verified.get("cache_object_id")
-                and plan["segment_start"] == verified.get("segment_start")
-                and plan["segment_end"] == verified.get("segment_end")
-                and 0 < plan["segment_start"]
-                <= plan["calibration_start"]
-                < plan["calibration_end"]
-                <= plan["reuse_start"]
-                < plan["reuse_end"]
-                <= plan["segment_end"]
-                <= request.num_prompt_tokens
-                and plan["reuse_start"] % alignment == 0
-                and plan["reuse_end"] % alignment == 0
-                and plan["block_alignment"] == alignment
-                and isinstance(plan.get("correction_alpha"), (int, float))
-                and not isinstance(plan.get("correction_alpha"), bool)
-                and float(plan["correction_alpha"]) == 0.6
-                and plan["reuse_end"] - plan["reuse_start"]
-                == plan["source_reuse_end"] - plan["source_reuse_start"]
-            )
-        if not valid:
-            self.connector.cancel_csk_prefetch(ticket, "invalid_reuse_plan")
-            return
-        assert isinstance(plan, dict)
-        self._cskcache_reuses[request.request_id] = _CSKCacheReuseState(
-            ticket=ticket, plan=dict(plan)
-        )
-        profile_event(
-            "csk_reuse_registered",
-            request.request_id,
-            ticket=ticket,
-            reuse_start=plan["reuse_start"],
-            reuse_end=plan["reuse_end"],
+        self.connector_scheduler.register(
+            request,
+            block_alignment=alignment,
+            async_scheduling=self.scheduler_config.async_scheduling,
         )
 
-    def _limit_cskcache_chunk(
+    def _limit_connector_prefill(
         self, request: Request, num_computed_tokens: int, num_new_tokens: int
     ) -> int:
-        state = self._cskcache_reuses.get(request.request_id)
-        if state is None or state.phase != "initial":
+        if self.connector_scheduler is None:
             return num_new_tokens
-        reuse_start = int(state.plan["reuse_start"])
-        if num_computed_tokens >= reuse_start:
-            state.phase = "fallback"
-            self._release_cskcache_lease(state)
-            return num_new_tokens
-        return min(num_new_tokens, reuse_start - num_computed_tokens)
-
-    def _release_cskcache_lease(self, state: _CSKCacheReuseState) -> bool:
-        if state.host_lease_owner != "scheduler" or self.connector is None:
-            return False
-        released = self.connector.release_csk_reuse(state.ticket)
-        if released:
-            state.host_lease_owner = "released"
-        return released
-
-    @staticmethod
-    def _handoff_cskcache_lease(state: _CSKCacheReuseState) -> None:
-        if state.host_lease_owner != "scheduler":
-            raise RuntimeError("CSKCache lease is not owned by the scheduler")
-        state.host_lease_owner = "worker"
-
-    def _release_cskcache_state(self, request_id: str) -> None:
-        state = self._cskcache_reuses.pop(request_id, None)
-        if state is not None:
-            self._release_cskcache_lease(state)
+        return self.connector_scheduler.limit_prefill(
+            request.request_id,
+            num_computed_tokens=num_computed_tokens,
+            num_new_tokens=num_new_tokens,
+        )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -628,7 +543,7 @@ class Scheduler(SchedulerInterface):
                 - request.num_computed_tokens
                 - self.num_sampled_tokens_per_step,
             )
-            num_new_tokens = self._limit_cskcache_chunk(
+            num_new_tokens = self._limit_connector_prefill(
                 request, request.num_computed_tokens, num_new_tokens
             )
 
@@ -793,11 +708,11 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
-                cskcache_state = self._cskcache_reuses.get(request_id)
-                is_cskcache_reentry = (
-                    cskcache_state is not None
-                    and cskcache_state.phase == "waiting"
-                    and request.status == RequestStatus.WAITING_FOR_CSKCACHE
+                is_connector_reentry = (
+                    self.connector_scheduler is not None
+                    and self.connector_scheduler.is_waiting(request_id)
+                    and request.status
+                    == RequestStatus.WAITING_FOR_KV_CONNECTOR
                 )
 
                 # try to promote blocked statuses while traversing skipped queue.
@@ -832,43 +747,19 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
 
-                # CSKCache resumes exactly at its authenticated reuse boundary.
-                if is_cskcache_reentry:
-                    assert cskcache_state is not None
-                    assert (
-                        request.num_computed_tokens
-                        == cskcache_state.plan["reuse_start"]
-                    )
+                # The connector computes calibration KV and installs the
+                # corrected suffix before the ordinary model forward resumes.
+                if is_connector_reentry:
                     new_computed_blocks = (
                         self.kv_cache_manager.empty_kv_cache_blocks
                     )
                     num_new_local_computed_tokens = 0
-                    readiness = cskcache_state.readiness or {}
-                    cskcache_state.readiness = None
-                    activated = None
-                    if (
-                        readiness.get("status") == "ready"
-                        and readiness.get("plan") == cskcache_state.plan
-                    ):
-                        activated = self.connector.activate_csk_reuse(
-                            cskcache_state.ticket, request_id
-                        )
-                    if activated == cskcache_state.plan:
-                        num_external_computed_tokens = (
-                            cskcache_state.plan["reuse_end"]
-                            - cskcache_state.plan["reuse_start"]
-                        )
-                        cskcache_state.phase = "activated"
-                        profile_event(
-                            "csk_reuse_scheduler_activate",
-                            request_id,
-                            ticket=cskcache_state.ticket,
-                            external_tokens=num_external_computed_tokens,
-                        )
-                    else:
-                        num_external_computed_tokens = 0
-                        cskcache_state.phase = "fallback"
-                        self._release_cskcache_lease(cskcache_state)
+                    assert self.connector_scheduler is not None
+                    activation = self.connector_scheduler.activate(
+                        request_id,
+                        num_computed_tokens=request.num_computed_tokens,
+                    )
+                    num_external_computed_tokens = activation.external_tokens
                     num_computed_tokens = (
                         request.num_computed_tokens
                         + num_external_computed_tokens
@@ -1033,7 +924,7 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
-                    num_new_tokens = self._limit_cskcache_chunk(
+                    num_new_tokens = self._limit_connector_prefill(
                         request, num_computed_tokens, num_new_tokens
                     )
                     assert num_new_tokens > 0
@@ -1074,7 +965,6 @@ class Scheduler(SchedulerInterface):
                 effective_lookahead_tokens = (
                     0 if limit_lookahead_tokens else self.num_lookahead_tokens
                 )
-
                 # Determine if we need to allocate cross-attention blocks.
                 num_encoder_tokens = 0
                 if (
@@ -1112,13 +1002,9 @@ class Scheduler(SchedulerInterface):
                 if new_blocks is None:
                     # The request cannot be scheduled.
 
-                    if (
-                        is_cskcache_reentry
-                        and cskcache_state is not None
-                        and cskcache_state.phase == "activated"
-                    ):
-                        self._release_cskcache_lease(cskcache_state)
-                        cskcache_state.phase = "fallback"
+                    if is_connector_reentry:
+                        assert self.connector_scheduler is not None
+                        self.connector_scheduler.allocation_failed(request_id)
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -1136,12 +1022,9 @@ class Scheduler(SchedulerInterface):
                         self.kv_cache_manager.get_blocks(request_id),
                         num_external_computed_tokens,
                     )
-                    if (
-                        is_cskcache_reentry
-                        and cskcache_state is not None
-                        and cskcache_state.phase == "activated"
-                    ):
-                        self._handoff_cskcache_lease(cskcache_state)
+                    if is_connector_reentry and num_external_computed_tokens > 0:
+                        assert self.connector_scheduler is not None
+                        self.connector_scheduler.handoff_to_worker(request_id)
                     if (
                         self.connector_prefix_cache_stats is not None
                         and connector_prefix_cache_queries != 0
@@ -1194,7 +1077,7 @@ class Scheduler(SchedulerInterface):
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
-                elif request.status == RequestStatus.WAITING_FOR_CSKCACHE:
+                elif request.status == RequestStatus.WAITING_FOR_KV_CONNECTOR:
                     scheduled_resumed_reqs.append(request)
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
@@ -1794,13 +1677,41 @@ class Scheduler(SchedulerInterface):
 
         failed_kv_load_req_ids = None
         if kv_connector_output and kv_connector_output.invalid_block_ids:
+            invalid_block_ids = set(kv_connector_output.invalid_block_ids)
+            request_block_ids = {}
+            if self.connector_scheduler is not None:
+                for request_id in self.connector_scheduler.request_ids():
+                    if request_id not in self.requests:
+                        continue
+                    (block_ids,) = self.kv_cache_manager.get_block_ids(request_id)
+                    request_block_ids[request_id] = block_ids
+                connector_failures, consumed_block_ids = (
+                    self.connector_scheduler.consume_invalid_blocks(
+                        invalid_block_ids,
+                        request_block_ids=request_block_ids,
+                        block_size=self.block_size,
+                    )
+                )
+            else:
+                connector_failures, consumed_block_ids = (), set()
+            for failure in connector_failures:
+                request = self.requests.get(failure.request_id)
+                if request is not None:
+                    request.num_computed_tokens = failure.recompute_from
+            invalid_block_ids.difference_update(consumed_block_ids)
             # These blocks contain externally computed tokens that failed to
             # load. Identify affected requests and adjust their computed token
             # count to trigger recomputation of the invalid blocks.
-            failed_kv_load_req_ids = self._handle_invalid_blocks(
-                kv_connector_output.invalid_block_ids,
-                num_scheduled_tokens,
-            )
+            # A scheduler extension may recover its own failed ranges. Only
+            # remaining connector failures enter the generic policy below.
+            failed_kv_load_req_ids = set()
+            if invalid_block_ids:
+                failed_kv_load_req_ids.update(
+                    self._handle_invalid_blocks(
+                        invalid_block_ids,
+                        num_scheduled_tokens,
+                    )
+                )
 
         # Persist per-step routed experts into the scheduler-side slot
         # buffer (CPU->CPU fancy-index assign; ~few MB per step).
@@ -1828,7 +1739,7 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
-        cskcache_waiting_reqs: set[Request] = set()
+        connector_waiting_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -1988,27 +1899,20 @@ class Scheduler(SchedulerInterface):
                 else:
                     stopped_preempted_reqs.add(request)
 
-            cskcache_state = self._cskcache_reuses.get(req_id)
             if (
-                cskcache_state is not None
-                and cskcache_state.phase == "initial"
-                and not stopped
-                and not new_token_ids
-                and request.status == RequestStatus.RUNNING
-                and request.num_computed_tokens
-                == cskcache_state.plan["reuse_start"]
-                and request.num_in_flight_tokens == 0
-            ):
-                cskcache_state.phase = "waiting"
-                request.status = RequestStatus.WAITING_FOR_CSKCACHE
-                self._inflight_prefills.discard(request)
-                cskcache_waiting_reqs.add(request)
-                profile_event(
-                    "csk_reuse_boundary_ready",
-                    request.request_id,
-                    ticket=cskcache_state.ticket,
-                    reuse_start=cskcache_state.plan["reuse_start"],
+                self.connector_scheduler is not None
+                and self.connector_scheduler.reaches_waiting_boundary(
+                    req_id,
+                    num_computed_tokens=request.num_computed_tokens,
+                    stopped=stopped,
+                    produced_tokens=bool(new_token_ids),
+                    request_running=request.status == RequestStatus.RUNNING,
+                    in_flight_tokens=request.num_in_flight_tokens,
                 )
+            ):
+                request.status = RequestStatus.WAITING_FOR_KV_CONNECTOR
+                self._inflight_prefills.discard(request)
+                connector_waiting_reqs.add(request)
 
             # Extract sample logprobs if needed.
             if (
@@ -2059,9 +1963,9 @@ class Scheduler(SchedulerInterface):
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
-        if cskcache_waiting_reqs:
-            self.running = remove_all(self.running, cskcache_waiting_reqs)
-            for request in cskcache_waiting_reqs:
+        if connector_waiting_reqs:
+            self.running = remove_all(self.running, connector_waiting_reqs)
+            for request in connector_waiting_reqs:
                 self.skipped_waiting.prepend_request(request)
 
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
@@ -2160,7 +2064,7 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
             RequestStatus.WAITING_FOR_REMOTE_KVS,
             RequestStatus.WAITING_FOR_STREAMING_REQ,
-            RequestStatus.WAITING_FOR_CSKCACHE,
+            RequestStatus.WAITING_FOR_KV_CONNECTOR,
         )
 
     def _enqueue_waiting_request(self, request: Request) -> None:
@@ -2335,7 +2239,7 @@ class Scheduler(SchedulerInterface):
             self.requests[request.request_id] = request
             if self.connector is not None:
                 self.connector.on_new_request(request)
-            self._register_cskcache_reuse(request)
+            self._register_connector_schedule(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
@@ -2408,7 +2312,8 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
-        self._release_cskcache_state(request.request_id)
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.finish(request.request_id)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing
@@ -2786,15 +2691,9 @@ class Scheduler(SchedulerInterface):
         """
         Try to promote a blocked waiting request back to schedulable states.
         """
-        if request.status == RequestStatus.WAITING_FOR_CSKCACHE:
-            state = self._cskcache_reuses[request.request_id]
-            readiness = self.connector.query_csk_readiness(
-                state.ticket, request.request_id
-            )
-            if readiness.get("status") == "loading":
-                return False
-            state.readiness = readiness
-            return True
+        if request.status == RequestStatus.WAITING_FOR_KV_CONNECTOR:
+            assert self.connector_scheduler is not None
+            return self.connector_scheduler.poll(request.request_id)
 
         if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
             # finished_recving_kv_req_ids is populated during

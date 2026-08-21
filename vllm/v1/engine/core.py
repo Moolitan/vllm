@@ -876,35 +876,14 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
-    def submit_csk_prefetch(self, ticket: str, skill_name: str) -> bool:
-        """Submit T0 prefetch without admitting request B to the scheduler."""
-        connector = self.scheduler.get_kv_connector()
-        if connector is None:
-            return False
-        return connector.submit_csk_prefetch(ticket, skill_name)
-
-    def inspect_csk_tool_observation(
-        self, ticket: str, tool_name: str, content: str
-    ) -> bool:
-        connector = self.scheduler.get_kv_connector()
-        if connector is None:
-            return False
-        return connector.inspect_csk_tool_observation(ticket, tool_name, content)
-
-    def authenticate_csk_request(
-        self, ticket: str, request_id: str, prompt_token_ids: list[int]
-    ) -> dict[str, Any] | None:
+    def execute_connector_control(
+        self, command: str, payload: dict[str, Any]
+    ) -> Any:
+        """Forward an opaque control-plane command to the active connector."""
         connector = self.scheduler.get_kv_connector()
         if connector is None:
             return None
-        return connector.authenticate_csk_request(
-            ticket, request_id, prompt_token_ids
-        )
-
-    def cancel_csk_prefetch(self, ticket: str, reason: str) -> None:
-        connector = self.scheduler.get_kv_connector()
-        if connector is not None:
-            connector.cancel_csk_prefetch(ticket, reason)
+        return connector.execute_connector_control(command, payload)
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.

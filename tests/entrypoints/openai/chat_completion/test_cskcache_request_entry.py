@@ -127,15 +127,18 @@ def test_candidate_is_authenticated_with_internal_request_id() -> None:
         "segment_start": 100,
         "segment_end": 2019,
     }
-    engine.authenticate_csk_request = AsyncMock(return_value=verified)
-    engine.cancel_csk_prefetch = AsyncMock()
+    engine.execute_connector_control = AsyncMock(return_value=verified)
 
     asyncio.run(engine._authenticate_cskcache_candidate(request))
 
-    engine.authenticate_csk_request.assert_awaited_once_with(
-        "tool-call-1", "chatcmpl-external-a1b2c3d4", [10, 11, 12]
+    engine.execute_connector_control.assert_awaited_once_with(
+        "cskcache.authenticate_request",
+        {
+            "ticket": "tool-call-1",
+            "request_id": "chatcmpl-external-a1b2c3d4",
+            "prompt_token_ids": [10, 11, 12],
+        },
     )
-    engine.cancel_csk_prefetch.assert_not_awaited()
     transfer_params = request.sampling_params.extra_args["kv_transfer_params"]
     assert "cskcache_candidate" not in transfer_params
     assert transfer_params["cskcache_verified"] == verified
@@ -164,17 +167,17 @@ def test_add_request_authenticates_only_after_internal_id_assignment() -> None:
 
     engine.input_processor.assign_request_id.side_effect = assign_internal_id
 
-    async def authenticate(ticket, request_id, prompt_token_ids):
+    async def execute_control(command, payload):
+        assert command == "cskcache.authenticate_request"
         return {
-            "ticket": ticket,
-            "request_id": request_id,
+            "ticket": payload["ticket"],
+            "request_id": payload["request_id"],
             "cache_object_id": "mcp-builder:object",
             "segment_start": 100,
             "segment_end": 2019,
         }
 
-    engine.authenticate_csk_request = AsyncMock(side_effect=authenticate)
-    engine.cancel_csk_prefetch = AsyncMock()
+    engine.execute_connector_control = AsyncMock(side_effect=execute_control)
 
     asyncio.run(
         engine.add_request(
@@ -182,8 +185,13 @@ def test_add_request_authenticates_only_after_internal_id_assignment() -> None:
         )
     )
 
-    engine.authenticate_csk_request.assert_awaited_once_with(
-        "tool-call-1", "chatcmpl-external-a1b2c3d4", [10, 11, 12]
+    engine.execute_connector_control.assert_awaited_once_with(
+        "cskcache.authenticate_request",
+        {
+            "ticket": "tool-call-1",
+            "request_id": "chatcmpl-external-a1b2c3d4",
+            "prompt_token_ids": [10, 11, 12],
+        },
     )
     admitted_request = engine.engine_core.add_request_async.await_args.args[0]
     assert admitted_request.request_id == "chatcmpl-external-a1b2c3d4"
@@ -196,14 +204,16 @@ def test_add_request_authenticates_only_after_internal_id_assignment() -> None:
 def test_parallel_candidate_is_cancelled_before_engine_admission() -> None:
     request = make_cskcache_candidate_request(n=2)
     engine = AsyncLLM.__new__(AsyncLLM)
-    engine.authenticate_csk_request = AsyncMock()
-    engine.cancel_csk_prefetch = AsyncMock()
+    engine.execute_connector_control = AsyncMock()
 
     asyncio.run(engine._authenticate_cskcache_candidate(request))
 
-    engine.authenticate_csk_request.assert_not_awaited()
-    engine.cancel_csk_prefetch.assert_awaited_once_with(
-        "tool-call-1", "parallel_sampling_unsupported"
+    engine.execute_connector_control.assert_awaited_once_with(
+        "cskcache.cancel_prefetch",
+        {
+            "ticket": "tool-call-1",
+            "reason": "parallel_sampling_unsupported",
+        },
     )
     transfer_params = request.sampling_params.extra_args["kv_transfer_params"]
     assert transfer_params == {"unrelated": "preserved"}
